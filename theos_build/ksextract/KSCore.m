@@ -621,16 +621,6 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     }
 
     // ---- 写入登录键 ----
-    // 键名表已用真机实测校准（快手 iOS 14.8.10 主二进制）：
-    //   存在: Gif_Token / Gif_Token_Salt / Gif_KwaiClientSalt /
-    //         Gif_ServiceToken / Gif_PassToken / Gif_H5Token /
-    //         Gif_User / Gif_LastLoginType / token_client_salt
-    //   不存在: gifshow_token / gifshow_userid（安卓那套 iOS 已废弃）
-    __block NSUInteger n = 0;
-    void (^put)(NSString *, NSString *) = ^(NSString *k, NSString *v) {
-        if (k.length && v.length) { plist[k] = v; n++; }
-    };
-
     // === 键名表：从快手 iOS 主二进制（com_kwai_gif，14.8.10）实测提取 ===
     //   实测存在：Gif_Token / Gif_Token_Salt / Gif_KwaiClientSalt /
     //            Gif_ServiceToken / Gif_PassToken / Gif_LastLoginType /
