@@ -525,6 +525,7 @@ static NSLock *gLock = nil;
 + (pid_t)pidFromSysctlQuiet:(NSString *)procName;
 + (BOOL)killPID:(pid_t)pid;
 + (NSString *)didFromKeychain;
++ (NSDictionary *)loadPlistAt:(NSString *)path;
 + (NSString *)didFromPlistDeep:(NSDictionary *)d;
 + (NSString *)egidFromContainerScan:(KSTarget *)t;
 @end
@@ -1178,10 +1179,60 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     return YES;
 }
 
+/// 多方式读取 plist（应对沙盒/文件权限差异）
+/// 实测：快手 plist 是 mobile:mobile 0600，App 同为 mobile 应该能读，
+///      但某些越狱环境会拦 NSDictionary 的直接读，需要多级回退。
++ (NSDictionary *)loadPlistAt:(NSString *)path {
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // 1) 标准方式
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:path];
+    if (d.count) return d;
+
+    // 2) NSData + NSPropertyListSerialization
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (data.length) {
+        id obj = [NSPropertyListSerialization
+                  propertyListWithData:data options:NSPropertyListImmutable
+                               format:NULL error:NULL];
+        if ([obj isKindOfClass:[NSDictionary class]] && [obj count]) {
+            [KSLog add:@"  (plist 用 NSPropertyListSerialization 读取)"];
+            return obj;
+        }
+    }
+
+    // 3) 路径兜底：/private 前缀（沙盒里 /var 与 /private/var 可能只有一个可读）
+    if ([path hasPrefix:@"/var/"]) {
+        NSString *alt = [@"/private" stringByAppendingString:path];
+        d = [NSDictionary dictionaryWithContentsOfFile:alt];
+        if (d.count) return d;
+    } else if ([path hasPrefix:@"/private/var/"]) {
+        NSString *alt = [path substringFromIndex:8];  // 去掉 /private
+        d = [NSDictionary dictionaryWithContentsOfFile:alt];
+        if (d.count) return d;
+    }
+
+    // 4) 诊断：文件到底能不能看见
+    [KSLog add:@"  [诊断] 文件存在=%@ 可读=%@ 大小=%@",
+     [fm fileExistsAtPath:path] ? @"是" : @"否",
+     [fm isReadableFileAtPath:path] ? @"是" : @"否",
+     [fm attributesOfItemAtPath:path error:NULL][NSFileSize] ?: @"?"];
+    return nil;
+}
+
 + (KSFive *)readCurrent:(KSTarget *)t {
-    if (!t.prefsPath) return nil;
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:t.prefsPath];
-    if (!d) return nil;
+    if (!t.prefsPath) {
+        [KSLog add:@"  ✗ prefsPath 为空"];
+        return nil;
+    }
+
+    // ★ 多种方式读取 plist（App 沙盒下某一种可能被拦）
+    NSDictionary *d = [self loadPlistAt:t.prefsPath];
+    if (!d) {
+        [KSLog add:@"  ✗ 读不了 plist: %@", t.prefsPath];
+        return nil;
+    }
+    [KSLog add:@"  plist 读取成功，%lu 个键", (unsigned long)d.count];
 
     // 取第一个存在且非空的字符串值（block 直接调用，ARC 下不能当函数指针强转）
     NSString *(^pick)(NSArray *) = ^NSString *(NSArray *keys) {
