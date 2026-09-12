@@ -1,0 +1,21 @@
+# 统一用 LF，避免 Windows 检出的 CRLF 把 shell/脚本类文件跑坏
+* text=auto eol=lf
+
+# 明确按文本处理
+*.m      text eol=lf
+*.h      text eol=lf
+*.py     text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.plist  text eol=lf
+*.md     text eol=lf
+Makefile text eol=lf
+control  text eol=lf
+*.sh     text eol=lf
+
+# 二进制文件不要碰
+*.deb    binary
+*.apk    binary
+*.dylib  binary
+*.png    binary
+*.jpg    binary

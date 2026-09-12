@@ -1,0 +1,28 @@
+iOS 快手上号器 —— Xcode 编译步骤
+========================================
+
+1. 打开 xcode_project/KSExtract.xcodeproj
+
+2. 设置签名（重要）：
+   Signing & Capabilities → 取消勾选 "Automatically manage signing"
+   然后手动选择你的证书（没有就选 "Sign to Run Locally"）
+
+3. 编译：Product → Archive → Export
+   或者命令行：
+     xcodebuild -project KSExtract.xcodeproj -scheme KSExtract \
+                -sdk iphoneos -configuration Release \
+                CODE_SIGNING_ALLOWED=NO \
+                CONFIGURATION_BUILD_DIR=./out
+
+4. 用 ldid 注入平台权限（关键，否则写不进快手沙盒）：
+     ldid -Sentitlements.plist ./out/KSExtract
+
+5. 打包成 deb：
+     python ../build_app.py --pack ./out/KSExtract.app
+
+6. 传到手机安装：
+     爱思助手 → 越狱 → 安装 DEB
+     或者 scp 到手机后 dpkg -i
+
+说明：第 4 步不可省略。platform-application 权限是 App 能写别的
+      App 沙盒的前提，对标安卓版的 su。

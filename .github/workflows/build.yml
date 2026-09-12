@@ -1,0 +1,213 @@
+name: Build iOS 上号器
+
+# 手动触发 + 推送到 main 自动触发
+on:
+  workflow_dispatch:
+    inputs:
+      make_release:
+        description: '是否发布 Release'
+        required: false
+        default: 'true'
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+jobs:
+  build:
+    # macOS runner —— iOS 编译必须。私有仓库按 $0.08/分钟计费
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 显示环境
+        run: |
+          echo "=== Xcode 版本 ==="
+          xcodebuild -version
+          echo "=== SDK ==="
+          xcodebuild -showsdks | grep -i ios || true
+          echo "=== Python ==="
+          python3 --version
+
+      - name: 安装 ldid
+        run: |
+          # ldid 是注入 entitlements 的关键工具，runner 默认没有
+          brew install ldid || {
+            echo "brew 装失败，从源码编译"
+            git clone --depth 1 https://github.com/ProcursusTeam/ldid.git /tmp/ldid
+            cd /tmp/ldid
+            git submodule update --init
+            make CXXFLAGS="-std=c++17" -j4
+            sudo cp ldid /usr/local/bin/ldid
+          }
+          ldid -v || ldid --version || echo "ldid 已安装"
+
+      - name: 安装 dpkg
+        run: |
+          # dpkg 用于打 deb
+          brew install dpkg || true
+
+      - name: 编译 App
+        run: |
+          set -e
+          # 注意：不要 cd 进 xcode_project 后再跑构建脚本。
+          # 直接进 xcode_project 用仓库里已检出的工程编译，
+          # 避免被工程生成器重建目录而把 cwd 删掉。
+          cd xcode_project
+
+          echo "=== 源码一致性检查 ==="
+          diff -q main.m  ../app/main.m  || { echo "main.m 与 app/ 不一致"; exit 1; }
+          diff -q KSCore.m ../app/KSCore.m || { echo "KSCore.m 与 app/ 不一致"; exit 1; }
+          diff -q KSCore.h ../app/KSCore.h || { echo "KSCore.h 与 app/ 不一致"; exit 1; }
+
+          rm -rf out
+          mkdir -p out
+
+          # ---- 主路径：xcodebuild ----
+          echo "=== 使用 xcodebuild ==="
+          xcodebuild \
+            -project KSExtract.xcodeproj \
+            -scheme KSExtract \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CONFIGURATION_BUILD_DIR="$PWD/out" \
+            build || echo "xcodebuild 失败，改用 clang 兜底"
+
+          # ---- 兜底：clang 直接编 ----
+          # 必须带 -lobjc（objc_msgSend 需要）与全部用到的 framework
+          if [ ! -f "out/KSExtract.app/KSExtract" ]; then
+            echo "=== 回退到 clang 直接编译 ==="
+            SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+            echo "SDK: $SDK"
+            APP=out/KSExtract.app
+            rm -rf "$APP"
+            mkdir -p "$APP"
+            cp Info.plist "$APP/"
+
+            xcrun -sdk iphoneos clang \
+              -arch arm64 \
+              -isysroot "$SDK" \
+              -miphoneos-version-min=14.0 \
+              -fobjc-arc \
+              -fmodules \
+              -lobjc \
+              -framework UIKit \
+              -framework Foundation \
+              -framework CoreFoundation \
+              -framework CoreServices \
+              -framework MobileCoreServices \
+              -Wno-deprecated-declarations \
+              -Wno-unused-function \
+              -o "$APP/KSExtract" \
+              main.m KSCore.m
+            echo "clang 编译完成"
+          fi
+
+          echo "=== 产物 ==="
+          ls -la out/KSExtract.app/
+          file out/KSExtract.app/KSExtract
+          # 必须是 arm64 Mach-O，否则后面打包出来是废包
+          file out/KSExtract.app/KSExtract | grep -q "arm64" \
+            || { echo "编译产物不是 arm64"; exit 1; }
+
+      - name: 注入 entitlements 签名
+        run: |
+          set -e
+          cd xcode_project
+          APP=out/KSExtract.app
+
+          # ★ 关键一步：没有这一步，App 就是普通沙盒 App，写不进快手目录
+          ldid -Sentitlements.plist "$APP/KSExtract"
+
+          echo "=== 签名结果 ==="
+          ldid -e "$APP/KSExtract"
+          # 确认 platform-application 真的注进去了
+          ldid -e "$APP/KSExtract" | grep -q "platform-application" \
+            || { echo "entitlements 注入失败：缺 platform-application"; exit 1; }
+
+          chmod +x "$APP/KSExtract"
+
+      - name: 打包 deb
+        run: |
+          set -e
+          cd xcode_project
+          # 把编译好的 .app 打成无根越狱 deb（装到 /var/jb/Applications）
+          python3 ../build_app.py --pack "$PWD/out/KSExtract.app"
+
+          echo "=== deb 已生成 ==="
+          ls -la ../build/
+
+      - name: 校验产物
+        run: |
+          set -e
+          echo "=== 构建产物 ==="
+          ls -la build/ || true
+          DEB=$(ls build/*FULL.deb 2>/dev/null | head -1)
+          if [ -z "$DEB" ]; then
+            echo "找不到 deb，列出 build 目录："
+            ls -laR build/ || true
+            exit 1
+          fi
+          echo "deb 路径: $DEB"
+          echo "deb 大小: $(du -h "$DEB" | cut -f1)"
+
+          echo "=== deb 内部结构 ==="
+          ar t "$DEB" || true
+          dpkg-deb -I "$DEB" || true
+          dpkg-deb -c "$DEB" || true
+
+          # ★ 硬校验：deb 里必须真的含可执行文件，且路径在 /var/jb 下
+          EXTRACT=$(mktemp -d)
+          dpkg-deb -x "$DEB" "$EXTRACT"
+          BIN=$(find "$EXTRACT" -name KSExtract -type f | head -1)
+          if [ -z "$BIN" ]; then
+            echo "deb 内没有 KSExtract 可执行文件"; exit 1
+          fi
+          echo "可执行文件: $BIN"
+          file "$BIN"
+          file "$BIN" | grep -q "arm64" || { echo "deb 内不是 arm64"; exit 1; }
+          case "$BIN" in
+            *"/var/jb/Applications/KSExtract.app/"*) echo "安装路径正确 ✓" ;;
+            *) echo "安装路径不对: $BIN"; exit 1 ;;
+          esac
+          test -x "$BIN" || { echo "可执行位丢失"; exit 1; }
+          test -f "$EXTRACT/var/jb/Applications/KSExtract.app/Info.plist" \
+            || { echo "缺 Info.plist"; exit 1; }
+          echo "=== deb 校验通过 ==="
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ks-ios-deb
+          path: build/*.deb
+          if-no-files-found: error
+
+      - name: 发布 Release
+        if: github.event_name == 'workflow_dispatch' && inputs.make_release == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ github.run_number }}
+          name: iOS 上号器 v${{ github.run_number }}
+          body: |
+            ## iOS 快手五参上号器
+
+            **安装**：下载 deb → 用爱思助手或 Filza 安装（无根越狱，装到 /var/jb）
+
+            **使用**：打开 App → 粘贴五参 → 点「一键上号」→ 自动打开快手
+
+            **五参格式**：`token----salt----did----egid----api_st`
+            （双参 token----salt 即可登录）
+
+            构建时间：${{ github.event.repository.updated_at }}
+          files: build/*.deb
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

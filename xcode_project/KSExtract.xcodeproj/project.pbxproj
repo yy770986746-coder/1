@@ -1,0 +1,195 @@
+// !$*UTF8*$!
+{{
+	archiveVersion = 1;
+	classes = {{
+	}};
+	objectVersion = 50;
+	objects = {{
+
+/* Begin PBXBuildFile section */
+		AA0000000000000000000001 /* main.m in Sources */ = {{isa = PBXBuildFile; fileRef = AB0000000000000000000001 /* main.m */; }};
+		AA0000000000000000000002 /* KSCore.m in Sources */ = {{isa = PBXBuildFile; fileRef = AB0000000000000000000002 /* KSCore.m */; }};
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		AB0000000000000000000001 /* main.m */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; }};
+		AB0000000000000000000002 /* KSCore.m */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = KSCore.m; sourceTree = "<group>"; }};
+		AB0000000000000000000003 /* KSCore.h */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = KSCore.h; sourceTree = "<group>"; }};
+		AB0000000000000000000004 /* Info.plist */ = {{isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; }};
+		AB0000000000000000000005 /* entitlements.plist */ = {{isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = entitlements.plist; sourceTree = "<group>"; }};
+		AB0000000000000000000006 /* KSExtract.app */ = {{isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KSExtract.app; sourceTree = BUILT_PRODUCTS_DIR; }};
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		AC0000000000000000000001 /* Frameworks */ = {{
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		}};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		AD0000000000000000000001 = {{
+			isa = PBXGroup;
+			children = (
+				AB0000000000000000000001 /* main.m */,
+				AB0000000000000000000002 /* KSCore.m */,
+				AB0000000000000000000003 /* KSCore.h */,
+				AB0000000000000000000004 /* Info.plist */,
+				AB0000000000000000000005 /* entitlements.plist */,
+				AD0000000000000000000002 /* Products */,
+			);
+			sourceTree = "<group>";
+		}};
+		AD0000000000000000000002 /* Products */ = {{
+			isa = PBXGroup;
+			children = (
+				AB0000000000000000000006 /* KSExtract.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		}};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		AE0000000000000000000001 /* KSExtract */ = {{
+			isa = PBXNativeTarget;
+			buildConfigurationList = AF0000000000000000000002 /* Build configuration list for PBXNativeTarget "KSExtract" */;
+			buildPhases = (
+				AC0000000000000000000002 /* Sources */,
+				AC0000000000000000000001 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = KSExtract;
+			productName = KSExtract;
+			productReference = AB0000000000000000000006 /* KSExtract.app */;
+			productType = "com.apple.product-type.application";
+		}};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		AE0000000000000000000002 /* Project object */ = {{
+			isa = PBXProject;
+			attributes = {{
+				LastUpgradeCheck = 1400;
+				TargetAttributes = {{
+					AE0000000000000000000001 = {{
+						CreatedOnToolsVersion = 14.0;
+					}};
+				}};
+			}};
+			buildConfigurationList = AF0000000000000000000001 /* Build configuration list for PBXProject "KSExtract" */;
+			compatibilityVersion = "Xcode 9.3";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+				"zh-Hans",
+			);
+			mainGroup = AD0000000000000000000001;
+			productRefGroup = AD0000000000000000000002 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				AE0000000000000000000001 /* KSExtract */,
+			);
+		}};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		AC0000000000000000000002 /* Sources */ = {{
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA0000000000000000000002 /* KSCore.m in Sources */,
+				AA0000000000000000000001 /* main.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		}};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		B0000000000000000000000001 /* Debug */ = {{
+			isa = XCBuildConfiguration;
+			buildSettings = {{
+				ARCHS = arm64;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				GCC_PREPROCESSOR_DEFINITIONS = ("DEBUG=1", "$(inherited)");
+				IPHONEOS_DEPLOYMENT_TARGET = 14.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+			}};
+			name = Debug;
+		}};
+		B0000000000000000000000002 /* Release */ = {{
+			isa = XCBuildConfiguration;
+			buildSettings = {{
+				ARCHS = arm64;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 14.0;
+				SDKROOT = iphoneos;
+				VALIDATE_PRODUCT = YES;
+			}};
+			name = Release;
+		}};
+		B0000000000000000000000003 /* Debug */ = {{
+			isa = XCBuildConfiguration;
+			buildSettings = {{
+				CODE_SIGN_IDENTITY = "";
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_ENTITLEMENTS = entitlements.plist;
+				INFOPLIST_FILE = Info.plist;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kuaishou.ioslogin;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				TARGETED_DEVICE_FAMILY = "1,2";
+				FRAMEWORK_SEARCH_PATHS = ("$(inherited)", "$(SDKROOT)/System/Library/PrivateFrameworks");
+			}};
+			name = Debug;
+		}};
+		B0000000000000000000000004 /* Release */ = {{
+			isa = XCBuildConfiguration;
+			buildSettings = {{
+				CODE_SIGN_IDENTITY = "";
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_ENTITLEMENTS = entitlements.plist;
+				INFOPLIST_FILE = Info.plist;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kuaishou.ioslogin;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				TARGETED_DEVICE_FAMILY = "1,2";
+				FRAMEWORK_SEARCH_PATHS = ("$(inherited)", "$(SDKROOT)/System/Library/PrivateFrameworks");
+			}};
+			name = Release;
+		}};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		AF0000000000000000000001 /* Build configuration list for PBXProject "KSExtract" */ = {{
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B0000000000000000000000001 /* Debug */,
+				B0000000000000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		}};
+		AF0000000000000000000002 /* Build configuration list for PBXNativeTarget "KSExtract" */ = {{
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B0000000000000000000000003 /* Debug */,
+				B0000000000000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		}};
+/* End XCConfigurationList section */
+	}};
+	rootObject = AE0000000000000000000002 /* Project object */;
+}}

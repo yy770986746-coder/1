@@ -1,0 +1,10 @@
+Package: com.kuaishou.ioslogin
+Name: 快手上号器
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 快手 iOS 上号器 —— 粘贴五参一键登录
+Maintainer: momo
+Author: momo
+Section: Utilities
+Depends: firmware (>= 14.0)
+Installed-Size: 512

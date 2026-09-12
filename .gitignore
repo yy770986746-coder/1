@@ -1,0 +1,31 @@
+# ---- 逆向参考用的临时目录（不必上传）----
+_apk/
+_jadx/
+_deb_inspect/
+__pycache__/
+*.pyc
+
+# ---- 参考 APK 体积大，按需保留 ----
+token_v1.0.4.apk
+
+# ---- 构建产物 ----
+build/*.deb
+build/*.app
+xcode_project/out/
+xcode_project/build/
+theos_build/ksextract/.theos/
+theos_build/ksextract/packages/
+theos_build/ksextract/.compiled
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 绝对不要提交的东西 ----
+*.token
+*token*.txt
+.env
+secrets*
+五参.txt
+*五参*.txt
