@@ -520,6 +520,8 @@ static NSLock *gLock = nil;
 + (BOOL)killKuaishouAndWait;
 + (pid_t)pidFromLaunchctlForBundle:(NSString *)bundleID;
 + (pid_t)pidFromProcForBundle:(NSString *)bundleID;
++ (pid_t)pidFromSysctlForName:(NSString *)procName;
++ (pid_t)pidFromSysctlQuiet:(NSString *)procName;
 + (BOOL)killPID:(pid_t)pid;
 @end
 
@@ -552,18 +554,17 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
 ///   - 必须用 /tmp（越狱环境下所有进程都可写）
 ///   - 返回空数组时必须能让调用方区分"命令没输出"和"根本没能执行"
 static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *args) {
-    // 依次尝试多个可写目录，避免因单一路径不可写而失败
-    NSArray *cand = @[@"/tmp/ks_cmd_out.txt",
-                      @"/var/tmp/ks_cmd_out.txt",
-                      [NSTemporaryDirectory() stringByAppendingPathComponent:@"ks_cmd_out.txt"]];
-    NSString *outPath = nil;
+    // ★ 实测坑：/tmp 是【相对符号链接】-> var/tmp，
+    //   app 沙盒里解析不了，必须用绝对路径 /var/tmp。
+    NSArray *cand = @[@"/var/tmp/ks_cmd_out.txt",
+                      @"/private/var/tmp/ks_cmd_out.txt"];
+    NSString *outPath = cand.firstObject;
     for (NSString *p in cand) {
         NSString *dir = [p stringByDeletingLastPathComponent];
         if ([[NSFileManager defaultManager] isWritableFileAtPath:dir]) {
             outPath = p; break;
         }
     }
-    if (!outPath) outPath = cand.firstObject;
     [[NSFileManager defaultManager] removeItemAtPath:outPath error:NULL];
 
     // 先确认可执行文件真实存在
@@ -612,20 +613,26 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 ///   因为快手进程不在 mobile 的可见范围内。
 ///   唯一可靠的方式是用 launchctl list 拿到 PID，再 kill -9。
 + (pid_t)pidFromLaunchctlForBundle:(NSString *)bundleID {
-    // ★ 实测（RootHide 无根越狱，03:33 真机日志）：
-    //   App 内 posix_spawn 调 launchctl 全部返回"无输出" —— RootHide 给 App 套了
-    //   容器沙盒，外部程序 spawn 不出来。因此把 /proc 探测提为主方案。
-    //
-    // 方案 A：直接遍历 /proc（不依赖任何外部命令，最可靠）
-    pid_t p = [self pidFromProcForBundle:bundleID];
-    if (p > 0) return p;
+    // ★ 实测（RootHide 无根越狱，真机日志）：
+    //   - iOS 上 /proc 不存在（"文件夹 proc 不存在"）
+    //   - ps / pgrep 未安装
+    //   - App 内 posix_spawn 调 launchctl 无输出（沙盒拦截外部程序）
+    //   → 唯一可靠的方式：Darwin 原生 sysctl(KERN_PROC_ALL)
+    NSArray *names = @[@"com_kwai_gif", @"com.kuaishou.nebula"];
+    for (NSString *n in names) {
+        pid_t p = [self pidFromSysctlForName:n];
+        if (p > 0) return p;
+    }
 
-    // 方案 B：launchctl（部分环境可用）
+    // 兜底：/proc（其他越狱环境可能有）
+    pid_t p2 = [self pidFromProcForBundle:bundleID];
+    if (p2 > 0) return p2;
+
+    // 再兜底：launchctl（部分环境可用）
     NSArray *paths = @[@"/usr/bin/launchctl", @"/var/jb/usr/bin/launchctl"];
     for (NSString *lp in paths) {
         NSArray *lines = runCmdCapture(lp, @[@"list"]);
-        if (!lines) continue;          // nil = 可执行文件不可用
-        if (!lines.count) continue;    // 空数组 = 执行了但无输出
+        if (!lines || !lines.count) continue;
         NSString *needle = [NSString stringWithFormat:@"UIKitApplication:%@", bundleID];
         for (NSString *l in lines) {
             if (![l containsString:needle]) continue;
@@ -639,7 +646,7 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
             if (i > start) {
                 NSString *num = [l substringWithRange:NSMakeRange(start, i - start)];
                 pid_t r = (pid_t)[num intValue];
-                [KSLog add:@"  launchctl(%@) 命中 → PID=%d", lp, (int)r];
+                [KSLog add:@"  launchctl 命中 → PID=%d", (int)r];
                 return r;
             }
         }
@@ -647,8 +654,53 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     return 0;
 }
 
+/// 用 Darwin 原生 sysctl 枚举进程（不依赖外部命令、不依赖 /proc）
+/// ★ 实测：iOS 上 /proc 不存在，ps/pgrep 也没装，
+///   唯一可用的进程枚举方式就是 sysctl(KERN_PROC_ALL) + proc_pidpath。
++ (pid_t)pidFromSysctlForName:(NSString *)procName {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t len = 0;
+
+    // 第一次：取所需缓冲区大小
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || len == 0) {
+        [KSLog add:@"  sysctl 取大小失败 (errno=%d)", errno];
+        return 0;
+    }
+    // 多留 20% 余量，避免进程数变化导致 ENOMEM
+    len = len * 12 / 10 + sizeof(struct kinfo_proc) * 16;
+    struct kinfo_proc *buf = malloc(len);
+    if (!buf) return 0;
+
+    if (sysctl(mib, 4, buf, &len, NULL, 0) != 0) {
+        [KSLog add:@"  sysctl 读进程列表失败 (errno=%d)", errno];
+        free(buf);
+        return 0;
+    }
+
+    int count = (int)(len / sizeof(struct kinfo_proc));
+    [KSLog add:@"  sysctl 枚举到 %d 个进程", count];
+    pid_t found = 0;
+
+    for (int i = 0; i < count; i++) {
+        pid_t p = buf[i].kp_proc.p_pid;
+        if (p <= 0) continue;
+        // 优先用 p_comm（内核里的进程名，就是可执行文件名）
+        NSString *comm = [NSString stringWithUTF8String:buf[i].kp_proc.p_comm];
+        if (comm.length && [comm isEqualToString:procName]) {
+            found = p;
+            [KSLog add:@"  sysctl 命中 %@ → PID=%d", comm, (int)p);
+            break;
+        }
+    }
+    free(buf);
+    if (!found) {
+        [KSLog add:@"  sysctl 里没有名为 %@ 的进程", procName];
+    }
+    return found;
+}
+
 /// 备用方案：直接遍历 /proc 找进程（不依赖任何外部命令）
-/// iOS 越狱环境下有 no-sandbox 权限的 App 可以读 /proc/<pid>/ 信息
+/// iOS 上通常不存在 /proc，留作兼容其他环境
 + (pid_t)pidFromProcForBundle:(NSString *)bundleID {
     NSFileManager *fm = [NSFileManager defaultManager];
     // 无根越狱下 /proc 存在两种可能，都试
@@ -734,12 +786,12 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         [KSLog add:@"  未找到快手进程（可能本来就没运行）"];
     }
 
-    // ---- 轮询确认：launchctl 和 /proc 两条路都查不到才算退出 ----
+    // ---- 轮询确认：用轻量的 sysctl 检测（避免刷屏日志）----
+    NSArray *aliveNames = @[@"com_kwai_gif", @"com.kuaishou.nebula"];
     for (int i = 0; i < 25; i++) {
         BOOL alive = NO;
-        for (NSString *bid in bids) {
-            if ([self pidFromLaunchctlForBundle:bid] > 0) { alive = YES; break; }
-            if ([self pidFromProcForBundle:bid] > 0)       { alive = YES; break; }
+        for (NSString *n in aliveNames) {
+            if ([self pidFromSysctlQuiet:n] > 0) { alive = YES; break; }
         }
         if (!alive) {
             [KSLog add:@"✓ 快手已完全退出（%.1f 秒）", (i + 1) * 0.2];
@@ -751,6 +803,28 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 
     [KSLog add:@"⚠ 5 秒内快手仍未退出，写入可能被覆盖"];
     return NO;
+}
+
+/// 静默版 sysctl 查进程（不写日志，供轮询使用）
++ (pid_t)pidFromSysctlQuiet:(NSString *)procName {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || len == 0) return 0;
+    len = len * 12 / 10 + sizeof(struct kinfo_proc) * 16;
+    struct kinfo_proc *buf = malloc(len);
+    if (!buf) return 0;
+    if (sysctl(mib, 4, buf, &len, NULL, 0) != 0) { free(buf); return 0; }
+
+    int count = (int)(len / sizeof(struct kinfo_proc));
+    pid_t found = 0;
+    for (int i = 0; i < count; i++) {
+        pid_t p = buf[i].kp_proc.p_pid;
+        if (p <= 0) continue;
+        const char *c = buf[i].kp_proc.p_comm;
+        if (c && strcmp(c, procName.UTF8String) == 0) { found = p; break; }
+    }
+    free(buf);
+    return found;
 }
 
 + (void)killKuaishou {
