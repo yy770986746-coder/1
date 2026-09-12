@@ -223,25 +223,102 @@ static NSLock *gLock = nil;
     return @[KS_BID_MAIN, KS_BID_LITE, KS_BID_OVERSEA];
 }
 
+/// 通过 LSApplicationWorkspace 查已安装 App 的容器路径（最可靠）
+/// 返回 nil 表示这个 bundleID 确实没装
++ (NSString *)lsWorkspaceDataContainer:(NSString *)bid {
+    Class ws = NSClassFromString(@"LSApplicationWorkspace");
+    if (!ws) return nil;
+
+    id inst = ((id(*)(id, SEL))objc_msgSend)(ws,
+                NSSelectorFromString(@"defaultWorkspace"));
+    if (!inst) return nil;
+
+    id proxy = ((id(*)(id, SEL, id))objc_msgSend)(inst,
+                  NSSelectorFromString(@"applicationProxyForIdentifier:"), bid);
+    if (!proxy) return nil;
+
+    // dataContainerURL 优先
+    if ([proxy respondsToSelector:NSSelectorFromString(@"dataContainerURL")]) {
+        id url = ((id(*)(id, SEL))objc_msgSend)(proxy,
+                    NSSelectorFromString(@"dataContainerURL"));
+        if (url) {
+            NSString *p = [url isKindOfClass:[NSURL class]]
+                            ? [(NSURL *)url path] : (NSString *)url;
+            if (p.length) return p;
+        }
+    }
+    // 退回 containerURL
+    if ([proxy respondsToSelector:NSSelectorFromString(@"containerURL")]) {
+        id url = ((id(*)(id, SEL))objc_msgSend)(proxy,
+                    NSSelectorFromString(@"containerURL"));
+        if (url) {
+            NSString *p = [url isKindOfClass:[NSURL class]]
+                            ? [(NSURL *)url path] : (NSString *)url;
+            if (p.length) return p;
+        }
+    }
+    return nil;
+}
+
+/// App .app 所在路径（bundle 容器）
++ (NSString *)lsWorkspaceBundlePath:(NSString *)bid {
+    Class ws = NSClassFromString(@"LSApplicationWorkspace");
+    if (!ws) return nil;
+    id inst = ((id(*)(id, SEL))objc_msgSend)(ws,
+                NSSelectorFromString(@"defaultWorkspace"));
+    if (!inst) return nil;
+    id proxy = ((id(*)(id, SEL, id))objc_msgSend)(inst,
+                  NSSelectorFromString(@"applicationProxyForIdentifier:"), bid);
+    if (!proxy) return nil;
+
+    if ([proxy respondsToSelector:NSSelectorFromString(@"bundleURL")]) {
+        id url = ((id(*)(id, SEL))objc_msgSend)(proxy,
+                    NSSelectorFromString(@"bundleURL"));
+        if (url) {
+            NSString *p = [url isKindOfClass:[NSURL class]]
+                            ? [(NSURL *)url path] : (NSString *)url;
+            if (p.length) return p;
+        }
+    }
+    return nil;
+}
+
+/// 从 .app 的 Info.plist 反查真正的 bundleID
+/// （有些版本/马甲包目录名和 bundleID 不一致，靠目录名匹配会漏）
++ (NSString *)bundleIDFromAppPath:(NSString *)appPath {
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                          [appPath stringByAppendingPathComponent:@"Info.plist"]];
+    return info[@"CFBundleIdentifier"];
+}
+
 /// 用私有 API 拿容器路径（App 带平台权限时可用）
 + (NSString *)containerForBundleID:(NSString *)bid {
-    // 1) MCM 私有接口（iOS 14+，越狱机上 App 有平台权限即可调）
-    Class mcm = NSClassFromString(@"MCMAppContainer");
-    if (mcm) {
-        id inst = ((id(*)(id, SEL))objc_msgSend)(mcm,
-                    NSSelectorFromString(@"containerWithIdentifier:createIfNecessary:error:"));
-        (void)inst;
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // 1) 先问 LSApplicationWorkspace —— 系统标准接口，最准
+    NSString *lsPath = [self lsWorkspaceDataContainer:bid];
+    if (lsPath && [fm fileExistsAtPath:lsPath]) {
+        [KSLog add:@"  [沙盒] LSApplicationWorkspace 命中: %@", lsPath];
+        return lsPath;
     }
 
-    // 2) 标准容器路径探测（无根越狱）
+    // 2) 标准容器路径探测
     NSArray *roots = @[
         @"/var/mobile/Containers/Data/Application",
         @"/private/var/mobile/Containers/Data/Application",
     ];
-    NSFileManager *fm = [NSFileManager defaultManager];
 
     for (NSString *root in roots) {
-        NSArray *dirs = [fm contentsOfDirectoryAtPath:root error:NULL];
+        NSError *err = nil;
+        NSArray *dirs = [fm contentsOfDirectoryAtPath:root error:&err];
+        if (!dirs) {
+            [KSLog add:@"  [沙盒] 读不了 %@ (%@)", root,
+             err.localizedDescription ?: @"未知错误"];
+            continue;
+        }
+        [KSLog add:@"  [沙盒] %@ 下 %lu 个容器，逐个比对", root,
+         (unsigned long)dirs.count];
+
         for (NSString *d in dirs) {
             NSString *container = [root stringByAppendingPathComponent:d];
             // 读 .com.apple.mobile_container_manager.metadata.plist 确认归属
@@ -249,6 +326,7 @@ static NSLock *gLock = nil;
                               @".com.apple.mobile_container_manager.metadata.plist"];
             NSDictionary *md = [NSDictionary dictionaryWithContentsOfFile:meta];
             if ([md[@"MCMMetadataIdentifier"] isEqualToString:bid]) {
+                [KSLog add:@"  [沙盒] 扫描命中: %@", container];
                 return container;
             }
         }
@@ -258,16 +336,41 @@ static NSLock *gLock = nil;
 
 + (NSString *)bundlePathForBundleID:(NSString *)bid {
     NSFileManager *fm = [NSFileManager defaultManager];
+
+    // 1) LSApplicationWorkspace 优先
+    NSString *lsBundle = [self lsWorkspaceBundlePath:bid];
+    if (lsBundle && [fm fileExistsAtPath:lsBundle]) {
+        return lsBundle;
+    }
+
+    // 2) 目录扫描（同时用 Info.plist 反查，兼容目录名与 bundleID 不同的情况）
     NSArray *roots = @[
         @"/var/containers/Bundle/Application",
         @"/private/var/containers/Bundle/Application",
     ];
     for (NSString *root in roots) {
-        NSArray *dirs = [fm contentsOfDirectoryAtPath:root error:NULL];
+        NSError *err = nil;
+        NSArray *dirs = [fm contentsOfDirectoryAtPath:root error:&err];
+        if (!dirs) {
+            [KSLog add:@"  [安装] 读不了 %@ (%@)", root,
+             err.localizedDescription ?: @"未知错误"];
+            continue;
+        }
         for (NSString *d in dirs) {
-            NSString *p = [root stringByAppendingPathComponent:
-                           [NSString stringWithFormat:@"%@/%@.app", d, bid]];
+            NSString *sub = [root stringByAppendingPathComponent:d];
+            // 先按标准命名试
+            NSString *p = [sub stringByAppendingPathComponent:
+                           [NSString stringWithFormat:@"%@.app", bid]];
             if ([fm fileExistsAtPath:p]) return p;
+
+            // 再扫这个目录下所有 .app，用 Info.plist 反查 bundleID
+            NSArray *apps = [fm contentsOfDirectoryAtPath:sub error:NULL];
+            for (NSString *a in apps) {
+                if (![a hasSuffix:@".app"]) continue;
+                NSString *ap = [sub stringByAppendingPathComponent:a];
+                NSString *realBid = [self bundleIDFromAppPath:ap];
+                if ([realBid isEqualToString:bid]) return ap;
+            }
         }
     }
     return nil;
@@ -277,28 +380,83 @@ static NSLock *gLock = nil;
     return [self bundlePathForBundleID:bid] != nil;
 }
 
+/// 检查自己有没有 platform-application 权限
++ (BOOL)hasPlatformEntitlement {
+    // 沙盒 App 读不了这个目录；能读就说明有平台权限
+    NSArray *c = [[NSFileManager defaultManager]
+                  contentsOfDirectoryAtPath:@"/var/mobile/Containers/Data/Application"
+                  error:NULL];
+    return c != nil;
+}
+
 + (instancetype)forBundleID:(NSString *)bid {
+    [KSLog add:@"[探测] 检查 %@ ...", bid];
+
     NSString *bp = [self bundlePathForBundleID:bid];
-    if (!bp) return nil;
+    if (!bp) {
+        [KSLog add:@"  [安装] 没找到 %@.app", bid];
+        return nil;
+    }
+    [KSLog add:@"  [安装] ✓ %@", bp];
 
     KSTarget *t = [KSTarget new];
     t.bundleID = bid;
     t.bundlePath = bp;
-    t.dataContainer = [self containerForBundleID:bid];
+
+    // 用 Info.plist 里的真实 bundleID 覆盖（马甲包/目录名不一致时）
+    NSString *realBid = [self bundleIDFromAppPath:bp];
+    if (realBid.length && ![realBid isEqualToString:bid]) {
+        [KSLog add:@"  [安装] 实际 bundleID 是 %@，已修正", realBid];
+        t.bundleID = realBid;
+    }
+
+    t.dataContainer = [self containerForBundleID:t.bundleID];
+    if (!t.dataContainer && ![t.bundleID isEqualToString:bid]) {
+        // 换回传入的 bid 再试一次
+        t.dataContainer = [self containerForBundleID:bid];
+    }
 
     if (t.dataContainer) {
-        t.prefsPath = [t.dataContainer stringByAppendingPathComponent:
-                       [NSString stringWithFormat:@"Library/Preferences/%@.plist", bid]];
+        t.prefsPath = [self prefsPathIn:t.dataContainer bundleID:t.bundleID];
     }
+
     // 进程名：可执行文件 basename
     t.processName = [bp.lastPathComponent stringByDeletingPathExtension];
+
+    if (!t.dataContainer) {
+        [KSLog add:@"  ⚠ 沙盒未定位，但 App 确实装了"];
+    }
     return t;
 }
 
+/// 在容器里找偏好文件，兼容多种落盘位置
++ (NSString *)prefsPathIn:(NSString *)container bundleID:(NSString *)bid {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *cands = @[
+        [NSString stringWithFormat:@"Library/Preferences/%@.plist", bid],
+        [NSString stringWithFormat:@"Library/Preferences/%@.plist", KS_BID_MAIN],
+        @"Library/Preferences/com.jiangjia.gif.plist",
+        @"Library/Preferences/gifshow.plist",
+    ];
+    for (NSString *rel in cands) {
+        NSString *p = [container stringByAppendingPathComponent:rel];
+        if ([fm fileExistsAtPath:p]) {
+            [KSLog add:@"  [沙盒] 偏好文件已存在: %@", rel];
+            return p;
+        }
+    }
+    // 都不存在就用标准路径（写入时会创建）
+    NSString *dflt = [container stringByAppendingPathComponent:
+                      [NSString stringWithFormat:@"Library/Preferences/%@.plist", bid]];
+    [KSLog add:@"  [沙盒] 偏好文件待创建: %@", dflt.lastPathComponent];
+    return dflt;
+}
+
+/// 探测目标：装了 .app 就算找到（沙盒稍后单独处理）
 + (instancetype)detect {
     for (NSString *bid in [self allBundleIDs]) {
         KSTarget *t = [self forBundleID:bid];
-        if (t && t.dataContainer) return t;
+        if (t) return t;   // ★ 不再要求 dataContainer 存在
     }
     return nil;
 }
@@ -422,17 +580,38 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
 }
 
 + (BOOL)writeOnly:(KSFive *)five target:(KSTarget *)t {
+    // 沙盒没定位到就现场再试一次（可能刚打开快手才建容器）
+    if (!t.dataContainer) {
+        [KSLog add:@"沙盒未定位，重新探测..."];
+        NSString *c = [KSTarget containerForBundleID:t.bundleID];
+        if (!c) c = [KSTarget containerForBundleID:KS_BID_MAIN];
+        if (c) {
+            t.dataContainer = c;
+            t.prefsPath = [KSTarget prefsPathIn:c bundleID:t.bundleID];
+            [KSLog add:@"✓ 补定位成功: %@", c];
+        }
+    }
+
     if (!t.prefsPath) {
         [KSLog add:@"✗ 未定位到快手 Preferences 路径"];
+        [KSLog add:@"  排查: 先手动打开一次快手，再点「诊断」看沙盒列表"];
+        [KSLog add:@"  权限: %@", [KSTarget hasPlatformEntitlement]
+                ? @"有平台权限" : @"✗ 无平台权限，写不进去"];
         return NO;
     }
 
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *dir = [t.prefsPath stringByDeletingLastPathComponent];
     if (![fm fileExistsAtPath:dir]) {
+        NSError *mkErr = nil;
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES
-                       attributes:nil error:NULL];
-        [KSLog add:@"创建 Preferences 目录"];
+                       attributes:nil error:&mkErr];
+        if (mkErr) {
+            [KSLog add:@"✗ 创建目录失败: %@", mkErr.localizedDescription];
+            [KSLog add:@"  这是权限问题，确认 App 有 platform-application"];
+            return NO;
+        }
+        [KSLog add:@"✓ 已创建 Preferences 目录"];
     }
 
     // 读现有 plist（保留其他键，不破坏快手配置）
@@ -444,29 +623,38 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     }
 
     // ---- 写入登录键 ----
-    // 对照组：安卓版只写 gifshow_token / gifshow_userid / token_client_salt
-    // iOS 侧快手用的是 Gif_* 命名空间，两套都写，确保命中
+    // 键名表已用真机实测校准（快手 iOS 14.8.10 主二进制）：
+    //   存在: Gif_Token / Gif_Token_Salt / Gif_KwaiClientSalt /
+    //         Gif_ServiceToken / Gif_PassToken / Gif_H5Token /
+    //         Gif_User / Gif_LastLoginType / token_client_salt
+    //   不存在: gifshow_token / gifshow_userid（安卓那套 iOS 已废弃）
     __block NSUInteger n = 0;
     void (^put)(NSString *, NSString *) = ^(NSString *k, NSString *v) {
         if (k.length && v.length) { plist[k] = v; n++; }
     };
 
-    // iOS 原生键（主线）
+    // === iOS 原生键（主线，实测存在）===
     put(@"Gif_Token",          five.token);
     put(@"Gif_Token_Salt",     five.salt);
     put(@"Gif_KwaiClientSalt", five.salt);
-    put(@"ClientSalt",         five.salt);
-
-    // 安卓等价键（兜底，部分版本共用）
-    put(@"gifshow_token",      five.token);
-    put(@"gifshow_userid",     [five userId]);
-    put(@"token_client_salt",  five.salt);
+    put(@"Gif_User",           [five userId]);
+    put(@"Gif_LastLoginType",  @"1");      // 1=正常登录
 
     // 可选参
     put(@"Gif_ServiceToken",   five.apiSt);
-    put(@"Gif_H5Token",        five.h5Token);
     put(@"Gif_PassToken",      five.passToken);
+    put(@"Gif_H5Token",        five.h5Token);
+
+    // === 兜底键（部分版本/组件的备用读法）===
+    put(@"token_client_salt",  five.salt);
+    put(@"ClientSalt",         five.salt);
     put(@"KS_OUTERID_KEY",     five.egid);
+    put(@"uid",                [five userId]);
+
+    // 安卓同名键：实测 iOS 14.8.10 已废弃，但老版本可能还在读，
+    // 写了不占地方也不影响，保留以兼容旧版。
+    put(@"gifshow_token",      five.token);
+    put(@"gifshow_userid",     [five userId]);
 
     if (n == 0) {
         [KSLog add:@"✗ 没有可写入的键"];
@@ -512,11 +700,30 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     };
 
     step(@"[1/6] 检查目标 App...", YES);
-    if (!t || !t.dataContainer) {
-        step(@"✗ 未找到快手沙盒，请先打开一次快手", NO);
+    if (!t) {
+        step(@"✗ 没找到快手，先确认已安装", NO);
         return NO;
     }
     step([NSString stringWithFormat:@"  ✓ %@", t.bundleID], YES);
+
+    // 沙盒没定位到就现场重试（容器可能刚建好 / LSApplicationWorkspace 才可用）
+    if (!t.dataContainer) {
+        step(@"  沙盒未定位，重新探测...", YES);
+        NSString *c = [KSTarget containerForBundleID:t.bundleID];
+        if (!c) c = [KSTarget containerForBundleID:KS_BID_MAIN];
+        if (c) {
+            t.dataContainer = c;
+            t.prefsPath = [KSTarget prefsPathIn:c bundleID:t.bundleID];
+        }
+    }
+    if (!t.dataContainer) {
+        step(@"✗ 未定位到快手沙盒", NO);
+        step(@"  1) 先手动打开一次快手再回来", NO);
+        step(@"  2) 点「诊断」看详细探测结果", NO);
+        step([NSString stringWithFormat:@"  平台权限: %@",
+              [KSTarget hasPlatformEntitlement] ? @"有" : @"✗ 没有"], NO);
+        return NO;
+    }
     step([NSString stringWithFormat:@"  ✓ 沙盒: %@", t.dataContainer], YES);
 
     step(@"[2/6] 校验五参...", YES);
@@ -580,9 +787,10 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
 
     NSArray *loginKeys = @[
         @"Gif_Token", @"Gif_Token_Salt", @"Gif_KwaiClientSalt", @"ClientSalt",
-        @"gifshow_token", @"gifshow_userid", @"token_client_salt",
+        @"Gif_User", @"Gif_LastLoginType",
         @"Gif_ServiceToken", @"Gif_H5Token", @"Gif_PassToken",
-        @"KS_OUTERID_KEY", @"token", @"egid",
+        @"gifshow_token", @"gifshow_userid", @"token_client_salt",
+        @"KS_OUTERID_KEY", @"token", @"egid", @"uid",
     ];
     NSUInteger removed = 0;
     for (NSString *k in loginKeys) {

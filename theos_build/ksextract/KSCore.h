@@ -75,6 +75,14 @@
 + (instancetype)forBundleID:(NSString *)bid;
 /// 是否已安装
 + (BOOL)isInstalled:(NSString *)bid;
+/// 本进程是否有 platform-application 权限
++ (BOOL)hasPlatformEntitlement;
+/// 全部候选 bundleID
++ (NSArray<NSString *> *)allBundleIDs;
+/// 查 .app 路径
++ (NSString *)bundlePathForBundleID:(NSString *)bid;
+/// 从 .app 的 Info.plist 反查真实 bundleID
++ (NSString *)bundleIDFromAppPath:(NSString *)appPath;
 /// 当前运行的快手进程名
 + (NSString *)runningProcessName;
 /// 拉起快手

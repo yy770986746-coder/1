@@ -9,6 +9,7 @@
 //
 
 #import <UIKit/UIKit.h>
+#import <unistd.h>
 #import "KSCore.h"
 
 #pragma mark - ========== 主界面 ==========
@@ -140,6 +141,14 @@
     [self.btnWipe addTarget:self action:@selector(doWipe) forControlEvents:UIControlEventTouchUpInside];
     y += 46;
 
+    // ---- 诊断 ----
+    UIButton *b6 = [self mkButton:@"诊断（检测不到快手时点这个）"
+                            color:[UIColor systemGrayColor]];
+    b6.frame = CGRectMake(12, y, W - 24, 38);
+    b6.titleLabel.font = [UIFont systemFontOfSize:14];
+    [b6 addTarget:self action:@selector(doDiagnose) forControlEvents:UIControlEventTouchUpInside];
+    y += 46;
+
     // ---- 自动打开快手 ----
     UIView *row = [[UIView alloc] initWithFrame:CGRectMake(12, y, W - 24, 40)];
     row.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
@@ -191,22 +200,89 @@
 
 - (void)refreshEnv {
     if (!self.target) {
-        self.statusLabel.text = @"✗ 未安装快手";
+        self.statusLabel.text = @"✗ 未检测到快手";
         self.statusLabel.textColor = [UIColor systemRedColor];
-        self.envLabel.text = @"请先在 App Store 安装快手";
+        self.envLabel.text = @"装了却检测不到？点「诊断」按钮";
         return;
     }
 
-    self.statusLabel.text = [NSString stringWithFormat:@"✓ 已就绪"];
-    self.statusLabel.textColor = [UIColor systemGreenColor];
-
     BOOL hasContainer = self.target.dataContainer.length > 0;
-    BOOL hasPrefs = self.target.prefsPath.length > 0;
 
-    self.envLabel.text = [NSString stringWithFormat:@"%@ · 沙盒%@ · 权限%@",
-                          self.target.bundleID,
-                          hasContainer ? @"已定位" : @"未定位",
-                          hasPrefs ? @"正常" : @"受限"];
+    if (hasContainer) {
+        self.statusLabel.text = @"✓ 已就绪";
+        self.statusLabel.textColor = [UIColor systemGreenColor];
+        self.envLabel.text = [NSString stringWithFormat:@"%@ · 沙盒已定位",
+                              self.target.bundleID];
+    } else {
+        // App 装了，但沙盒没定位到 —— 不是"没装"，别误导用户
+        self.statusLabel.text = @"⚠ 已装快手，沙盒未定位";
+        self.statusLabel.textColor = [UIColor systemOrangeColor];
+        self.envLabel.text = [NSString stringWithFormat:@"%@ · 点「诊断」看详情",
+                              self.target.bundleID];
+    }
+}
+
+#pragma mark - 诊断
+
+- (void)doDiagnose {
+    [KSLog add:@"======== 诊断开始 ========"];
+    [KSLog add:@"进程权限: uid=%d (0=root, 501=mobile)", getuid()];
+    [KSLog add:@"平台权限: %@",
+     [KSTarget hasPlatformEntitlement] ? @"✓ 有" : @"✗ 没有（能装但写不进快手）"];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *probe = @[
+        @"/var/containers/Bundle/Application",
+        @"/private/var/containers/Bundle/Application",
+        @"/var/mobile/Containers/Data/Application",
+        @"/private/var/mobile/Containers/Data/Application",
+        @"/var/jb/Applications",
+    ];
+    for (NSString *p in probe) {
+        BOOL exists = [fm fileExistsAtPath:p];
+        NSArray *c = exists ? [fm contentsOfDirectoryAtPath:p error:NULL] : nil;
+        [KSLog add:@"%@ 存在=%@ 可读=%@ 条目=%lu",
+         p, exists ? @"是" : @"否",
+         c ? @"是" : @"否", (unsigned long)(c ? c.count : 0)];
+    }
+
+    [KSLog add:@"---- 逐个 bundleID 探测 ----"];
+    for (NSString *bid in [KSTarget allBundleIDs]) {
+        NSString *bp = [KSTarget bundlePathForBundleID:bid];
+        [KSLog add:@"%@ -> %@", bid, bp ?: @"未找到"];
+    }
+
+    [KSLog add:@"---- 扫到的所有 App ----"];
+    for (NSString *root in @[@"/var/containers/Bundle/Application",
+                             @"/private/var/containers/Bundle/Application"]) {
+        NSArray *dirs = [fm contentsOfDirectoryAtPath:root error:NULL];
+        for (NSString *d in dirs) {
+            NSString *sub = [root stringByAppendingPathComponent:d];
+            NSArray *apps = [fm contentsOfDirectoryAtPath:sub error:NULL];
+            for (NSString *a in apps) {
+                if (![a hasSuffix:@".app"]) continue;
+                NSString *ap = [sub stringByAppendingPathComponent:a];
+                NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                                      [ap stringByAppendingPathComponent:@"Info.plist"]];
+                NSString *rb = info[@"CFBundleIdentifier"];
+                if ([rb containsString:@"kwai"] || [rb containsString:@"gif"] ||
+                    [rb containsString:@"kuaishou"] || [rb containsString:@"jiangjia"] ||
+                    [rb containsString:@"nebula"]) {
+                    [KSLog add:@"★ 疑似快手: %@  (%@)", rb, a];
+                }
+            }
+        }
+    }
+
+    [KSLog add:@"======== 诊断结束 ========"];
+    [self refreshLog];
+
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"诊断完成"
+                         message:@"结果已写入下方运行日志，请截图发我"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 #pragma mark - 动作
@@ -258,9 +334,15 @@
         return;
     }
 
-    if (!self.target || !self.target.dataContainer) {
-        [self alert:@"未定位到快手沙盒\n\n请先打开一次快手，再回来点登录"];
+    if (!self.target) {
+        [self alert:@"没检测到快手\n\n点「诊断」按钮看详细结果"];
         return;
+    }
+
+    if (!self.target.dataContainer) {
+        // 不硬拦：可能打开快手后容器才建好，交给 runLogin 现场重试
+        [KSLog add:@"⚠ 沙盒尚未定位，将尝试自动重探"];
+        [self refreshLog];
     }
 
     if (![f usable]) {
