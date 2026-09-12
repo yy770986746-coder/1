@@ -617,6 +617,10 @@ Installed-Size: 1024
     data_buf = io.BytesIO()
     with tarfile.open(fileobj=data_buf, mode="w:xz") as tf:
         if app_dir and os.path.isdir(app_dir):
+            # ★ 打包前强制保证图标齐全 + Info.plist 是二进制格式，
+            #   否则装到设备上桌面不显示图标（iOS 11+ 只从 bplist 读图标）。
+            _write_icons(app_dir)
+            _to_binary_plist(app_dir)
             # rel 以 .app 自身的父目录为基准，这样 rel 里天然带 "KSExtract.app/"
             app_root = os.path.dirname(os.path.abspath(app_dir))
             # 先写目录条目，保证 dpkg 解包时中间层级都存在
@@ -805,15 +809,17 @@ def _png_bytes(size, rgba_fill, bolt=True):
 
 
 def _write_icons(app_dir):
-    """把图标写进 .app（不依赖 Pillow），返回是否成功"""
+    """把图标写进 .app（不依赖 Pillow），返回是否成功
+
+    ★ 命名必须与能正常显示图标的越狱 app 一致（实测对比 RootHide/Sileo/Patcher）：
+        AppIcon60x60@2x.png / AppIcon60x60@3x.png
+        AppIcon76x76@2x.png
+      iOS 只认这几档，多余的 @1x 反而无用。
+    """
     try:
-        base = _png_bytes(120, (255, 122, 0, 255))
-        # CFBundleIconFiles 里声明的是 AppIcon60x60，所以要生成各倍图
         targets = {
-            "AppIcon60x60@1x.png": 60,
             "AppIcon60x60@2x.png": 120,
             "AppIcon60x60@3x.png": 180,
-            "AppIcon76x76@1x.png": 76,
             "AppIcon76x76@2x.png": 152,
         }
         for name, sz in targets.items():
@@ -823,6 +829,31 @@ def _write_icons(app_dir):
     except Exception as e:
         print("[图标] 生成失败: %s" % e)
         return False
+
+
+def _to_binary_plist(app_dir):
+    """把 .app/Info.plist 从 XML 转成二进制格式
+
+    ★ 关键：实测对比发现，桌面能显示图标的越狱 app，Info.plist 全是 bplist00
+      （二进制），而我们的包是 <?xml。iOS 11+ 的 SpringBoard 只从二进制 plist
+      读取图标信息，XML 格式会导致 app 不显示在桌面。
+    """
+    import plistlib
+    path = os.path.join(app_dir, "Info.plist")
+    if not os.path.exists(path):
+        print("[plist] Info.plist 不存在，跳过")
+        return False
+    with open(path, "rb") as f:
+        head = f.read(8)
+    if head.startswith(b"bplist"):
+        print("[plist] 已是二进制格式")
+        return True
+    with open(path, "rb") as f:
+        data = plistlib.load(f)
+    with open(path, "wb") as f:
+        plistlib.dump(data, f, fmt=plistlib.FMT_BINARY)
+    print("[plist] 已转为二进制格式")
+    return True
 
 
 def _w(path, content):
@@ -843,7 +874,9 @@ def main():
 
     if args.icons:
         ok = _write_icons(args.icons)
-        print("[图标] %s" % ("已生成" if ok else "跳过（没装 Pillow）"))
+        print("[图标] %s" % ("已生成" if ok else "生成失败"))
+        # ★ 图标生成了还不够：Info.plist 必须是二进制格式，否则桌面不显示
+        _to_binary_plist(args.icons)
         return 0
 
     if args.pack:

@@ -185,6 +185,22 @@ jobs:
           test -x "$BIN" || { echo "可执行位丢失"; exit 1; }
           test -f "$EXTRACT/var/jb/Applications/KSExtract.app/Info.plist" \
             || { echo "缺 Info.plist"; exit 1; }
+
+          # ★ 关键校验：Info.plist 必须是二进制格式（bplist00）
+          #   iOS 11+ 的 SpringBoard 只从二进制 plist 读取图标信息；
+          #   XML 格式会导致装完后桌面不显示图标。
+          APPDIR="$EXTRACT/var/jb/Applications/KSExtract.app"
+          head -c 8 "$APPDIR/Info.plist" | grep -q "bplist" \
+            || { echo "Info.plist 不是二进制格式，桌面会没图标"; exit 1; }
+          echo "Info.plist 为二进制格式 ✓"
+
+          # ★ 图标文件必须存在
+          ICON=$(find "$APPDIR" -maxdepth 1 -name 'AppIcon60x60@2x.png' | head -1)
+          if [ -z "$ICON" ]; then
+            echo "缺 AppIcon60x60@2x.png，桌面会没图标"; exit 1
+          fi
+          echo "图标存在 ✓: $(ls "$APPDIR" | grep -c '^AppIcon') 个图标文件"
+
           echo "=== deb 校验通过 ==="
 
       - name: 上传 artifact
