@@ -38,11 +38,11 @@
 
 @property (nonatomic, copy) NSString *token;
 @property (nonatomic, copy) NSString *salt;
-@property (nonatomic, copy) NSString *did;
+@property (nonatomic, copy) NSString *did;      // uid（32位hex-数字）
 @property (nonatomic, copy) NSString *egid;
-@property (nonatomic, copy) NSString *apiSt;
-@property (nonatomic, copy) NSString *h5Token;
-@property (nonatomic, copy) NSString *passToken;
+@property (nonatomic, copy) NSString *apiSt;    // api_st（64位hex）
+@property (nonatomic, copy) NSString *hToken;
+@property (nonatomic, copy) NSString *passToken; // serviceToken（base64 protobuf）
 
 /// 从任意文本解析（五参行 / JSON / 键值对 / 中文破折号）
 + (instancetype)fromText:(NSString *)text;
