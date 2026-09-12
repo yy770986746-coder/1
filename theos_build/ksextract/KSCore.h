@@ -111,6 +111,9 @@
 /// 读回当前生效的五参
 + (KSFive *)readCurrent:(KSTarget *)target;
 
+/// 提取当前设备五参并拼接成一行（---- 分隔），同时写日志。失败返回 nil
++ (NSString *)currentFiveLine:(KSTarget *)target;
+
 /// 清除登录态（回到未登录）
 + (BOOL)clearLogin:(KSTarget *)target;
 
@@ -119,6 +122,9 @@
 
 /// 结束快手进程
 + (void)killKuaishou;
+
+/// 结束快手进程并轮询确认已退出（写 plist 前必须调用）
++ (BOOL)killKuaishouAndWait;
 
 @end
 

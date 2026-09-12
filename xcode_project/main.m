@@ -27,6 +27,24 @@
 @property (nonatomic, strong) KSTarget    *target;
 @property (nonatomic, assign) BOOL        busy;
 
+// ★ 显式声明 UI 回调，避免 "no visible @interface declares the selector" 编译错误
+- (void)refreshLog;
+- (void)refreshEnv;
+- (void)doLogin;
+- (void)doRead;
+- (void)doWipe;
+- (void)doClear;
+- (void)doClearInput;
+- (void)doOpenKS;
+- (void)doDiagnose;
+- (void)doCheck;
+- (void)doPaste;
+- (void)doCopyLog;
+- (void)doClearLog;
+- (void)alert:(NSString *)msg;
+- (UIButton *)mkButton:(NSString *)title color:(UIColor *)color;
+- (void)setBusy:(BOOL)busy;
+
 @end
 
 @implementation KSViewController
@@ -178,16 +196,52 @@
     [scroll addSubview:lbl2];
     y += 20;
 
-    self.logView = [[UITextView alloc] initWithFrame:CGRectMake(12, y, W - 24, 260)];
+    // ★ 日志区：对标安卓版 —— 等宽字体、可滚动、自动滚到底部
+    //   之前日志"不显示"的原因：
+    //   1) UITextView 默认有内边距，文字容易被裁掉
+    //   2) 高度固定 260，内容一多就看不到最新的
+    //   3) 没有自动滚动到底部
+    self.logView = [[UITextView alloc] initWithFrame:CGRectMake(12, y, W - 24, 320)];
     self.logView.editable = NO;
-    self.logView.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
+    self.logView.selectable = YES;           // 允许选中复制
+    self.logView.scrollEnabled = YES;
+    self.logView.alwaysBounceVertical = YES;
+    self.logView.font = [UIFont fontWithName:@"Menlo" size:10]
+                        ?: [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    self.logView.textColor = [UIColor labelColor];
     self.logView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     self.logView.layer.cornerRadius = 10;
+    self.logView.layer.borderWidth = 1;
+    self.logView.layer.borderColor = [UIColor separatorColor].CGColor;
     self.logView.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
+    self.logView.textContainer.lineFragmentPadding = 0;   // 去掉默认缩进
+    self.logView.layoutManager.allowsNonContiguousLayout = NO; // 保证能滚到末尾
     [scroll addSubview:self.logView];
-    y += 270;
+    y += 330;
+
+    // ★ 日志区按钮（对标安卓：复制 / 清空）
+    UIButton *bCopy = [self mkButton:@"复制日志" color:[UIColor systemTealColor]];
+    bCopy.frame = CGRectMake(12, y, (W - 36) / 2, 36);
+    [bCopy addTarget:self action:@selector(doCopyLog) forControlEvents:UIControlEventTouchUpInside];
+
+    UIButton *bClr = [self mkButton:@"清空日志" color:[UIColor systemGrayColor]];
+    bClr.frame = CGRectMake(24 + (W - 36) / 2, y, (W - 36) / 2, 36);
+    [bClr addTarget:self action:@selector(doClearLog) forControlEvents:UIControlEventTouchUpInside];
+    y += 44;
 
     scroll.contentSize = CGSizeMake(W, y + 20);
+}
+
+- (void)doCopyLog {
+    NSString *t = [KSLog dump];
+    if (!t.length) { [self alert:@"日志为空"]; return; }
+    [UIPasteboard generalPasteboard].string = t;
+    [self alert:@"日志已复制到剪贴板"];
+}
+
+- (void)doClearLog {
+    [KSLog clear];
+    [self refreshLog];
 }
 
 - (UIButton *)mkButton:(NSString *)title color:(UIColor *)color {
@@ -488,10 +542,23 @@
 }
 
 - (void)refreshLog {
-    self.logView.text = [KSLog dump];
-    if (self.logView.text.length) {
-        [self.logView scrollRangeToVisible:NSMakeRange(self.logView.text.length, 0)];
+    NSString *txt = [KSLog dump];
+    if (!txt) txt = @"";
+    self.logView.text = txt;
+
+    // ★ 自动滚到底部（对标安卓的日志跟随）
+    //   分两步：先排版，再滚动，否则文本还没更新时滚不到末尾
+    if (txt.length) {
+        NSRange end = NSMakeRange(txt.length - 1, 1);
+        [self.logView scrollRangeToVisible:end];
+        // 强制布局一次再滚，确保长日志也能滚到最底
+        [self.logView layoutIfNeeded];
+        [self.logView scrollRangeToVisible:end];
     }
+
+    // 同时把日志写到系统控制台，方便 SSH 查看
+    printf("%s\n", txt.UTF8String);
+    fflush(stdout);
 }
 
 - (void)alert:(NSString *)msg {
