@@ -697,53 +697,73 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     //   实测不存在：gifshow_token / gifshow_userid（Android 专用，iOS 不认）
     //              Gif_User（iOS 用的是 Gif_ID / Gif_Kwai_ID）
     __block NSUInteger n = 0;
-    // 注意：v 允许是空串 —— 资料类键写成空串是刻意的，
-    // 用来避免快手 UI 读到 nil 时崩在 layoutSublayers。
+    // put  用于字符串；类型必须与真实登录态一致，否则快手读出来是 nil/错值
     void (^put)(NSString *, NSString *) = ^(NSString *k, NSString *v) {
         if (k.length && v != nil) { plist[k] = v; n++; }
+    };
+    void (^putB)(NSString *, BOOL) = ^(NSString *k, BOOL v) {
+        if (k.length) { plist[k] = @(v); n++; }
+    };
+    void (^putI)(NSString *, NSInteger) = ^(NSString *k, NSInteger v) {
+        if (k.length) { plist[k] = @(v); n++; }
     };
 
     NSString *uid = [five userId];
 
-    // === 核心登录键（iOS 命名，二进制实测存在）===
-    put(@"Gif_Token",          five.token);   // 第1段：完整 "32位hex-用户ID"
-    put(@"Gif_Token_Salt",     five.salt);    // 第2段：32位hex
-    put(@"Gif_KwaiClientSalt", five.salt);    // 同一份 salt，客户端另一处读法
+    // === 核心登录键 ===
+    // ★ 类型严格对齐「已登录真机实测快照」：
+    //   Gif_Token          str  "32位hex-uid"
+    //   Gif_Token_Salt     str  32位hex
+    //   Gif_KwaiClientSalt str  与 Token_Salt 同值
+    //   Gif_ID             int  ← 不是字符串！
+    //   Gif_LastLoginType  str  "phone_captcha_login" ← 不是 "1"！
+    //   Gif_Kwai_New_User  bool ← 不是 "0"！
+    put(@"Gif_Token",          five.token);
+    put(@"Gif_Token_Salt",     five.salt);
+    put(@"Gif_KwaiClientSalt", five.salt);
 
-    // uid：iOS 用 Gif_ID / Gif_Kwai_ID（不是 Gif_User —— 那个键不存在）
-    put(@"Gif_ID",             uid);
-    put(@"Gif_Kwai_ID",        uid);
+    // uid 写成整型（真机实测 Gif_ID 是 int 类型 4188087200）
+    NSInteger uidNum = (NSInteger)[uid longLongValue];
+    putI(@"Gif_ID", uidNum > 0 ? uidNum : 0);
 
-    // 登录态标记
-    put(@"Gif_LastLoginType",  @"1");         // 1 = 正常登录
-    put(@"Gif_Kwai_New_User",  @"0");         // 0 = 老用户
+    // 登录类型：真机值是 phone_captcha_login（手机验证码登录）
+    put(@"Gif_LastLoginType",  @"phone_captcha_login");
+    putB(@"Gif_Kwai_New_User", NO);      // 老用户 = 布尔 NO
 
     // ★★ 用户资料键：必须补上，否则快手读到"已登录"后渲染资料页时
     //    拿到 nil 会在主线程 layoutSublayers 抛 NSException 直接 SIGTRAP 闪退。
     //    这些键在 iOS 主二进制里都存在，只是我们之前没写。
     put(@"Gif_Name",           five.nickName.length ? five.nickName : @"快手用户");
-    put(@"Gif_HeadUrl",        five.headUrl.length ? five.headUrl : @"");
-    put(@"Gif_BigHeadUrls",    five.headUrl.length ? five.headUrl : @"");
+    put(@"Gif_HeadUrl",        five.headUrl.length ? five.headUrl
+                              : @"http://alimov2.a.yximgs.com/kos/nlav12689/head.jpg");
     put(@"Gif_defaultHead",    @"");          // 空串而非 nil，避免 UI 拿到 nil
-    put(@"Gif_Sex",            @"0");         // 0 = 未知，避免性别枚举越界
+    put(@"Gif_Sex",            @"U");         // 真机值 "U"（未知），不是 "0"
     put(@"Gif_Email",          @"");
     put(@"Gif_FansNumber",     @"0");
-    put(@"Gif_ProfileUserType",@"0");
-    put(@"Gif_Background",     @"");          // 个人页背景，同样不能是 nil
+    putI(@"Gif_ProfileUserType", 1);          // 真机实测是整型 1
+    put(@"Gif_Background",     @"http://static.yximgs.com/s1/i/def/bg2.jpg");
     put(@"Gif_pendantType",    @"0");         // 挂件类型，枚举必须有值
     put(@"Gif_pendantUrls",    @"");
-    put(@"Gif_Contacts_Uploaded", @"0");
+    putB(@"Gif_Contacts_Uploaded", NO);       // 真机是布尔
+    putB(@"Gif_defaultHead",   NO);           // 覆盖上面的空串：真机是布尔 False
     put(@"Gif_User_Text",      @"");
     put(@"Gif_H",              @"");
 
-    // === 服务端票据（第4/5段）===
-    // 第5段 base64 解出来是 protobuf：字段1 = "kuaishou.api.st"
-    //   → 名字里带 st(service token)，所以它才是 Gif_ServiceToken
-    // 第4段 64 位 hex（用户称之为 egid/api_st）→ Gif_PassToken
+    // === 服务端票据 ===
+    // 实测三个 token 的 protobuf 名称（从已登录真机反解）：
+    //   Gif_ServiceToken ← "kuaishou.api.st"        339 字符  → 对应参数【第5段】✓
+    //   Gif_PassToken    ← "passport.ks-pass-token" 391 字符  → 参数里没有
+    //   Gif_H5Token      ← "kuaishou.h5.st"         338 字符  → 参数里没有
+    // 用户参数的 339 字符与 ServiceToken 完全吻合，所以第5段进 Gif_ServiceToken。
+    // PassToken / H5Token 参数未提供，留空即可 —— 实测 iOS 会自行向后端换取。
     put(@"Gif_ServiceToken",   five.passToken.length ? five.passToken : five.apiSt);
-    put(@"Gif_PassToken",      five.apiSt.length ? five.apiSt : five.passToken);
+    if (five.hToken.length) {
+        put(@"Gif_H5Token",    five.hToken);
+    }
 
-    // === 兜底键名（不同版本/组件的备用读法）===
+    // === 兜底键名（真机实测存在）===
+    // 注意：token_client_salt / ClientSalt 存的是【第2段】，
+    //       而 Gif_Token_Salt 在真机上与它们同值，所以两边一致。
     put(@"token_client_salt",  five.salt);
     put(@"ClientSalt",         five.salt);
     put(@"uid",                uid);
