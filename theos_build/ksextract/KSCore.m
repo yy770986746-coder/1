@@ -515,6 +515,7 @@ static NSLock *gLock = nil;
                                path:(NSString *)prefsPath
                              domain:(NSString *)bundleID;
 + (void)flushDaemons;
++ (NSString *)currentFiveLine:(KSTarget *)t;
 @end
 
 @implementation KSInjector
@@ -538,6 +539,48 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     int status = 0;
     waitpid(pid, &status, 0);
     return WEXITSTATUS(status);
+}
+
+/// 用 posix_spawn 调系统命令并捕获 stdout（返回按行拆分的数组）
+/// 注意：必须先把输出重定向到临时文件，再读取 —— 直接管道读在沙盒里容易死锁。
+static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *args) {
+    NSString *outPath = [NSTemporaryDirectory()
+                         stringByAppendingPathComponent:@"ks_cmd_out.txt"];
+    [[NSFileManager defaultManager] removeItemAtPath:outPath error:NULL];
+
+    pid_t pid = 0;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO,
+                                     [outPath fileSystemRepresentation],
+                                     O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO,
+                                     "/dev/null", O_WRONLY, 0);
+
+    const char *argv[16];
+    int i = 0;
+    argv[i++] = [path UTF8String];
+    for (NSString *a in args) {
+        if (i >= 15) break;
+        argv[i++] = [a UTF8String];
+    }
+    argv[i] = NULL;
+
+    int rc = posix_spawn(&pid, [path UTF8String], &fa, NULL,
+                         (char *const *)argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) return @[];
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    NSString *txt = [NSString stringWithContentsOfFile:outPath
+                                              encoding:NSUTF8StringEncoding
+                                                 error:NULL];
+    [[NSFileManager defaultManager] removeItemAtPath:outPath error:NULL];
+    if (!txt.length) return @[];
+    return [txt componentsSeparatedByCharactersInSet:
+            [NSCharacterSet newlineCharacterSet]];
 }
 
 + (void)killKuaishou {
@@ -895,18 +938,144 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     NSString *(^pick)(NSArray *) = ^NSString *(NSArray *keys) {
         for (NSString *k in keys) {
             id v = d[k];
-            if (v && [v isKindOfClass:[NSString class]] && [v length]) return v;
+            if ([v isKindOfClass:[NSString class]] && [v length]) return v;
+            if ([v isKindOfClass:[NSNumber class]]) return [v stringValue];
         }
         return nil;
     };
 
     KSFive *f = [KSFive new];
-    f.token = pick(@[@"Gif_Token", @"gifshow_token", @"token"]) ?: @"";
-    f.salt  = pick(@[@"Gif_Token_Salt", @"Gif_KwaiClientSalt",
-                     @"token_client_salt", @"ClientSalt"]) ?: @"";
-    f.apiSt = pick(@[@"Gif_ServiceToken", @"api_st"]) ?: @"";
-    f.egid  = pick(@[@"KS_OUTERID_KEY", @"egid"]) ?: @"";
+
+    // === 第1段 token ===
+    // 提取器逻辑：先取 Gif_Token，若不是 "32位hex-数字" 格式，
+    // 回退到老版的 kwapp_host_path_db.db 的 host_path_table 表
+    NSString *token = pick(@[@"Gif_Token", @"gifshow_token"]);
+    NSRegularExpression *tokenRe =
+        [NSRegularExpression regularExpressionWithPattern:
+         @"^[0-9a-fA-F]{32}-\\d+" options:0 error:NULL];
+    BOOL tokenOK = token.length &&
+        [tokenRe numberOfMatchesInString:token options:0
+                                   range:NSMakeRange(0, token.length)] > 0;
+    if (!tokenOK) {
+        NSString *old = [self tokenFromKwappDB:t];
+        if (old.length) {
+            [KSLog add:@"  Gif_Token 格式不符，改用 kwapp DB 的 host_path_table"];
+            token = old;
+        }
+    }
+    f.token = token ?: @"";
+
+    // === 第2段 salt ===
+    f.salt = pick(@[@"Gif_Token_Salt", @"Gif_KwaiClientSalt",
+                    @"token_client_salt", @"ClientSalt"]) ?: @"";
+
+    // === 第3段 did（提取器：KLink_Persistent_klink.device_id 优先，其次 WeaponUUIDKey）===
+    f.did = pick(@[@"KLink_Persistent_klink.device_id", @"WeaponUUIDKey"]) ?: @"";
+
+    // === 第4段 egid ===
+    // 提取器：在日志文件里正则找 global_id=DFP[0-9A-Fa-f]{40,64}，找不到才用 KS_OUTERID_KEY
+    NSString *egid = [self egidFromLogs:t];
+    if (!egid.length) {
+        egid = pick(@[@"KS_OUTERID_KEY"]);
+    }
+    f.egid = egid ?: @"";
+
+    // === 第5段 api_st ===
+    f.apiSt = pick(@[@"Gif_ServiceToken"]) ?: @"";
+
+    f.userIdFromToken = [f userId];
     return f.token.length ? f : nil;
+}
+
+/// 老版快手的 token 在 kwapp_host_path_db.db 的 host_path_table 里（host_id-owner_id）
++ (NSString *)tokenFromKwappDB:(KSTarget *)t {
+    NSString *db = [t.dataContainer stringByAppendingPathComponent:
+                    @"Library/KWApp/kwapp_host_path_db.db"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:db]) return nil;
+
+    NSString *sqlPath = [NSTemporaryDirectory()
+                         stringByAppendingPathComponent:@"ks_kwapp.sql"];
+    // 用 sqlite3 命令行提取（避免引入 libsqlite3 依赖）
+    NSString *sql = @"SELECT host_id || '-' || owner_id FROM host_path_table LIMIT 1;";
+    if (![sql writeToFile:sqlPath atomically:YES encoding:NSUTF8StringEncoding error:NULL])
+        return nil;
+
+    NSArray *lines = runCmdCapture(@"/usr/bin/sqlite3", @[db, sql]);
+    for (NSString *l in lines) {
+        NSString *v = [l stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (v.length) return v;
+    }
+    return nil;
+}
+
+/// 在快手日志里找 egid（DFP 设备指纹）
+/// 提取器做法：正则 global_id=DFP[0-9A-Fa-f]{40,64}
++ (NSString *)egidFromLogs:(KSTarget *)t {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *logRoot = [t.dataContainer
+                         stringByAppendingPathComponent:@"Documents/com.hawkeye.data"];
+    if (![fm fileExistsAtPath:logRoot]) return nil;
+
+    NSRegularExpression *re =
+        [NSRegularExpression regularExpressionWithPattern:
+         @"global_id=(DFP[0-9A-Fa-f]{40,64})" options:0 error:NULL];
+
+    NSDirectoryEnumerator *en = [fm enumeratorAtPath:logRoot];
+    int scanned = 0;
+    for (NSString *rel in en) {
+        if (scanned++ > 600) break;
+        NSString *full = [logRoot stringByAppendingPathComponent:rel];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+        NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
+        if ([attr fileSize] > 4 * 1024 * 1024) continue;
+
+        NSData *data = [NSData dataWithContentsOfFile:full];
+        if (!data || data.length > 4 * 1024 * 1024) continue;
+        // 用 latin-1 解码（日志是二进制+文本混合）
+        NSString *s = [[NSString alloc] initWithData:data
+                                            encoding:NSISOLatin1StringEncoding];
+        if (!s.length) continue;
+        NSTextCheckingResult *m = [re firstMatchInString:s options:0
+                                                   range:NSMakeRange(0, s.length)];
+        if (m && m.numberOfRanges > 1) {
+            NSString *hit = [s substringWithRange:[m rangeAtIndex:1]];
+            [KSLog add:@"  egid 从日志提取: %@", rel];
+            return hit;
+        }
+    }
+    return nil;
+}
+
+/// 输出当前设备的五参（拼接成 ---- 分隔的一行），返回该字符串
++ (NSString *)currentFiveLine:(KSTarget *)t {
+    KSFive *f = [self readCurrent:t];
+    if (!f) {
+        [KSLog add:@"✗ 读取失败：没找到 Gif_Token（可能未登录）"];
+        return nil;
+    }
+
+    // ★ 顺序与输入一致：token / salt / did / egid / apiSt
+    NSArray *parts = @[
+        f.token.length    ? f.token    : @"",
+        f.salt.length     ? f.salt     : @"",
+        f.did.length      ? f.did      : @"",
+        f.egid.length     ? f.egid     : @"",
+        f.apiSt.length    ? f.apiSt    : @"",
+    ];
+    NSString *line = [parts componentsJoinedByString:@"----"];
+
+    [KSLog add:@"──── 当前设备五参 ────"];
+    [KSLog add:@"1 token  %@", f.token.length ? f.token : @"(缺失)"];
+    [KSLog add:@"2 salt   %@", f.salt.length ? f.salt : @"(缺失)"];
+    [KSLog add:@"3 did    %@", f.did.length ? f.did : @"(缺失)"];
+    [KSLog add:@"4 egid   %@", f.egid.length ? f.egid : @"(缺失)"];
+    [KSLog add:@"5 apiSt  %@", f.apiSt.length ? f.apiSt : @"(缺失)"];
+    [KSLog add:@"  uid    %@", [f userId] ?: @"?"];
+    [KSLog add:@"──── 拼接结果（已复制） ────"];
+    [KSLog add:@"%@", line];
+    return line;
 }
 
 + (BOOL)clearLogin:(KSTarget *)t {
@@ -942,21 +1111,101 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
 
     [self killKuaishou];
 
-    // 等价安卓 pm clear：删掉整个 Data 容器内容
-    // 保守做法：只删 Library 下的缓存与偏好，保留 Documents（避免误删用户文件）
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *subs = @[@"Library/Preferences", @"Library/Caches",
-                      @"Library/Cookies", @"Library/WebKit"];
 
+    // ★ 关键：快手的登录/账号数据不只在 Library，还散落在 Documents 下。
+    //   实测这些目录都含登录态：
+    //     Documents/mmkv/          （键值库，kswitchesVerKey.<uid> 等）
+    //     Documents/imsdk/<uid>/   （私信数据库，目录名就是 uid）
+    //     Documents/imdata/<uid>/  （用户信息 sqlite）
+    //     Library/Preferences/     （com.jiangjia.gif.plist 主登录键）
+    //     Library/KSKVCache/       （账号 KV）
+    //     Library/Cookies WebKit   （网页登录态）
+    //   只清 Library 是不够的 —— 这正是之前"点了清空但快手没变化"的原因。
+    NSArray *subs = @[
+        @"Library/Preferences",
+        @"Library/Caches",
+        @"Library/Cookies",
+        @"Library/WebKit",
+        @"Library/HTTPStorages",
+        @"Library/KSKVCache",
+        @"Library/Saved Application State",
+        @"Documents/mmkv",
+        @"Documents/imsdk",
+        @"Documents/imdata",
+        @"Documents/com.hawkeye.data",
+        @"Documents/com.kuaishou.eve.db",
+        @"Documents/ksdownload",
+    ];
+
+    NSUInteger total = 0;
     for (NSString *s in subs) {
         NSString *p = [t.dataContainer stringByAppendingPathComponent:s];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:p isDirectory:&isDir]) continue;
+
         NSArray *items = [fm contentsOfDirectoryAtPath:p error:NULL];
+        NSUInteger ok = 0;
         for (NSString *it in items) {
-            [fm removeItemAtPath:[p stringByAppendingPathComponent:it] error:NULL];
+            if ([fm removeItemAtPath:[p stringByAppendingPathComponent:it]
+                               error:NULL]) ok++;
         }
-        [KSLog add:@"  已清理 %@（%lu 项）", s, (unsigned long)items.count];
+        total += ok;
+        [KSLog add:@"  清理 %-32@ %lu/%lu", s, (unsigned long)ok,
+         (unsigned long)items.count];
+    }
+
+    // AppGroup 共享容器（group.com.kwai.video）里也有账号痕迹
+    NSArray *groups = [self appGroupContainers];
+    for (NSString *g in groups) {
+        NSString *p = [g stringByAppendingPathComponent:@"Library/Preferences"];
+        NSArray *items = [fm contentsOfDirectoryAtPath:p error:NULL];
+        NSUInteger ok = 0;
+        for (NSString *it in items) {
+            if ([fm removeItemAtPath:[p stringByAppendingPathComponent:it]
+                               error:NULL]) ok++;
+        }
+        total += ok;
+        if (items.count) {
+            [KSLog add:@"  清理 AppGroup Preferences %lu 项", (unsigned long)ok];
+        }
+    }
+
+    [KSLog add:@"  合计清理 %lu 项", (unsigned long)total];
+
+    // 清完必须刷新 cfprefsd，否则它会用内存缓存把文件写回来
+    [self flushDaemons];
+
+    // 校验：主 plist 是否真的被清掉
+    if (t.prefsPath) {
+        NSDictionary *after = [NSDictionary dictionaryWithContentsOfFile:t.prefsPath];
+        if (after.count == 0) {
+            [KSLog add:@"  ✓ 主 plist 已清空"];
+        } else {
+            [KSLog add:@"  ⚠ 主 plist 仍有 %lu 个键", (unsigned long)after.count];
+        }
     }
     return YES;
+}
+
+/// 找出所有 group.com.kwai.video 的 AppGroup 共享容器
++ (NSArray<NSString *> *)appGroupContainers {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *root = @"/var/mobile/Containers/Shared/AppGroup";
+    NSMutableArray *out = [NSMutableArray array];
+    NSArray *dirs = [fm contentsOfDirectoryAtPath:root error:NULL];
+    for (NSString *d in dirs) {
+        NSString *c = [root stringByAppendingPathComponent:d];
+        NSString *meta = [c stringByAppendingPathComponent:
+                          @".com.apple.mobile_container_manager.metadata.plist"];
+        NSDictionary *m = [NSDictionary dictionaryWithContentsOfFile:meta];
+        NSString *ident = m[@"MCMMetadataIdentifier"];
+        if ([ident isKindOfClass:[NSString class]] &&
+            ([ident containsString:@"kwai"] || [ident containsString:@"gif"])) {
+            [out addObject:c];
+        }
+    }
+    return out;
 }
 
 @end

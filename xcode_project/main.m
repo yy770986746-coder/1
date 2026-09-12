@@ -422,15 +422,27 @@
 
 - (void)doRead {
     if (!self.target) { [self alert:@"未找到快手"]; return; }
-    KSFive *f = [KSInjector readCurrent:self.target];
-    if (f) {
-        [KSLog add:@"---- 当前生效五参 ----"];
-        [KSLog add:@"%@", [f toLine]];
-        [KSLog add:@"uid=%@  可用=%@", [f userId], [f usable] ? @"是" : @"否"];
+    NSString *line = [KSInjector currentFiveLine:self.target];
+    if (line.length) {
+        [KSLog add:@"---- 可直接复制使用 ----"];
+        [KSLog add:@"%@", line];
+        [self refreshLog];
+
+        // 同时输出到控制台（越狱环境下可用 SSH 或日志工具查看）
+        printf("\n===== 当前设备五参 =====\n%s\n========================\n",
+               line.UTF8String);
+        fflush(stdout);
+
+        // 复制到剪贴板，方便直接粘贴
+        UIPasteboard *pb = [UIPasteboard generalPasteboard];
+        pb.string = line;
+        [self alert:[NSString stringWithFormat:
+                      @"已读取并复制到剪贴板：\n\n%@", line]];
     } else {
-        [KSLog add:@"当前无生效五参（未登录状态）"];
+        [KSLog add:@"✗ 读取失败：当前没登录或 plist 无 Gif_Token"];
+        [self refreshLog];
+        [self alert:@"读取失败：设备当前未登录快手"];
     }
-    [self refreshLog];
 }
 
 - (void)doOpenKS {
