@@ -519,6 +519,7 @@ static NSLock *gLock = nil;
 + (NSString *)currentFiveLine:(KSTarget *)t;
 + (BOOL)killKuaishouAndWait;
 + (pid_t)pidFromLaunchctlForBundle:(NSString *)bundleID;
++ (pid_t)pidFromProcForBundle:(NSString *)bundleID;
 + (BOOL)killPID:(pid_t)pid;
 @end
 
@@ -605,10 +606,11 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     for (NSString *p in paths) {
         lines = runCmdCapture(p, @[@"list"]);
         if (lines.count) { usedPath = p; break; }
+        [KSLog add:@"    %@ 无输出", p];
     }
     if (!lines.count) {
-        [KSLog add:@"  ⚠ launchctl 无输出（所有路径都试过）"];
-        return 0;
+        [KSLog add:@"  ⚠ launchctl 所有路径都无输出，改用 /proc 探测"];
+        return [self pidFromProcForBundle:bundleID];
     }
     if (usedPath) [KSLog add:@"  使用 %@ 查进程", usedPath];
 
@@ -625,9 +627,54 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
                 characterIsMember:[l characterAtIndex:i]]) i++;
         if (i > start) {
             NSString *num = [l substringWithRange:NSMakeRange(start, i - start)];
-            return (pid_t)[num intValue];
+            pid_t p = (pid_t)[num intValue];
+            [KSLog add:@"  launchctl 命中 %@ → PID=%d", bundleID, (int)p];
+            return p;
         }
     }
+    [KSLog add:@"  launchctl 里没有 %@（可能未运行）", bundleID];
+    return 0;
+}
+
+/// 备用方案：直接遍历 /proc 找进程（不依赖任何外部命令）
+/// iOS 越狱环境下有 no-sandbox 权限的 App 可以读 /proc/<pid>/ 信息
++ (pid_t)pidFromProcForBundle:(NSString *)bundleID {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    // 无根越狱下 /proc 存在两种可能，都试
+    NSString *procRoot = @"/proc";
+    NSArray *procs = [fm contentsOfDirectoryAtPath:procRoot error:NULL];
+    if (!procs.count) {
+        procRoot = @"/var/jb/proc";
+        procs = [fm contentsOfDirectoryAtPath:procRoot error:NULL];
+    }
+    if (!procs.count) {
+        [KSLog add:@"  /proc 不可读，无法探测进程"];
+        return 0;
+    }
+    [KSLog add:@"  遍历 %@（%lu 项）", procRoot, (unsigned long)procs.count];
+
+    // 快手主进程名固定是 com_kwai_gif
+    NSArray *targets = @[@"com_kwai_gif", @"com.kuaishou.nebula"];
+    NSCharacterSet *nonDigit = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+
+    for (NSString *d in procs) {
+        if ([d rangeOfCharacterFromSet:nonDigit].location != NSNotFound) continue;
+        NSString *commPath = [NSString stringWithFormat:@"%@/%@/comm", procRoot, d];
+        NSString *comm = [NSString stringWithContentsOfFile:commPath
+                                                  encoding:NSUTF8StringEncoding
+                                                     error:NULL];
+        if (!comm.length) continue;
+        comm = [comm stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        for (NSString *tg in targets) {
+            if ([comm isEqualToString:tg]) {
+                pid_t p = (pid_t)[d intValue];
+                [KSLog add:@"  /proc 命中 %@ → PID=%d", comm, (int)p];
+                return p;
+            }
+        }
+    }
+    [KSLog add:@"  /proc 里没找到快手进程"];
     return 0;
 }
 
@@ -666,18 +713,19 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     }
 
     if (!didKill) {
-        [KSLog add:@"  未从 launchctl 找到快手进程（可能本来就没运行）"];
+        [KSLog add:@"  未找到快手进程（可能本来就没运行）"];
     }
 
-    // ---- 轮询确认：launchctl 里不再出现该 bundle ----
+    // ---- 轮询确认：launchctl 和 /proc 两条路都查不到才算退出 ----
     for (int i = 0; i < 25; i++) {
         BOOL alive = NO;
         for (NSString *bid in bids) {
             if ([self pidFromLaunchctlForBundle:bid] > 0) { alive = YES; break; }
+            if ([self pidFromProcForBundle:bid] > 0)       { alive = YES; break; }
         }
         if (!alive) {
             [KSLog add:@"✓ 快手已完全退出（%.1f 秒）", (i + 1) * 0.2];
-            usleep(400 * 1000);   // 再等 0.4s 让系统完成后台数据落盘
+            usleep(500 * 1000);   // 再等 0.5s 让系统完成后台数据落盘
             return YES;
         }
         usleep(200 * 1000);
