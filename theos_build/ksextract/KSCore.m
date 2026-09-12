@@ -1287,13 +1287,16 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     f.did = did ?: @"";
 
     // === 第4段 egid ===
-    // ★ 实测判据（来自真机 Cache.db-wal）：
-    //   请求参数串里 did 和 egid 同现："...;did=<UUID>;didTag=0;egid=DFP...;gid=DFP...;"
-    //   缓存里会有多个历史 DFP（每次改机都生成新的），
-    //   所以【优先选与当前 did 同现的那个】，而不是随便取一个。
-    NSString *egid = [self egidScan:f.did];          // 与 did 关联查找（最可靠）
-    if (!egid.length) egid = [self egidFromLogs:t];  // global_id=DFP
-    if (!egid.length) egid = pick(@[@"KS_OUTERID_KEY"]);
+    // ★ 实测校准（真机 KSURLCache/Cache.db-wal）：
+    //   请求 URL 里 did= / egid= / global_id= 三者并存且值互不相同：
+    //     did=BEA9D9B2-...           ← 设备 ID
+    //     egid=DFP4563194B86C2...    ← ★ 第4段要的就是这个
+    //     global_id=DFP2F2703D7DB... ← 另一个字段，不能混用
+    //   而 plist 的 KS_OUTERID_KEY 是 32 位 hex（实测 863bfb78...），
+    //   【不是】DFP 格式，绝不能拿它当 egid。
+    NSString *egid = [self egidScan:f.did];          // 只认 egid=DFP...
+    if (!egid.length) egid = [self egidFromLogs:t];  // 日志里的 egid=DFP...
+    // 注意：不再回退 KS_OUTERID_KEY（格式不符，是错的）
     f.egid = egid ?: @"";
 
     // === 第5段 api_st ===
@@ -1326,19 +1329,22 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     ];
 
     NSString *best = nil;
-    NSUInteger bestOff = 0;
-    NSUInteger scanned = 0;
 
     for (NSString *sub in subs) {
         NSString *dir = [[self containerRoot] stringByAppendingPathComponent:sub];
+        BOOL dIsDir = NO;
+        if (![fm fileExistsAtPath:dir isDirectory:&dIsDir] || !dIsDir) continue;
+
+        NSUInteger used = 0, budget = 300;
         NSDirectoryEnumerator *en = [fm enumeratorAtPath:dir];
         for (NSString *rel in en) {
-            if (scanned++ > 300) break;
+            if (used >= budget) break;
             NSString *full = [dir stringByAppendingPathComponent:rel];
             BOOL isDir = NO;
             if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+            used++;
             NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
-            if ([attr fileSize] > 8 * 1024 * 1024) continue;
+            if ([attr fileSize] > 16 * 1024 * 1024) continue;
 
             NSData *data = [NSData dataWithContentsOfFile:full];
             if (!data.length) continue;
@@ -1351,12 +1357,8 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
             // 取该文件里【最后一个】did=（越靠后越新）
             NSTextCheckingResult *last = ms.lastObject;
             if (!last || last.numberOfRanges < 2) continue;
-            NSUInteger off = last.range.location;
             NSString *v = [txt substringWithRange:[last rangeAtIndex:1]];
-            if (off >= bestOff) {
-                bestOff = off;
-                best = v;
-            }
+            if (v.length) { best = v; break; }
         }
         if (best) break;   // 找到就停（KSURLCache 最权威）
     }
@@ -1488,6 +1490,9 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
          @"DFP[0-9A-Fa-f]{40,64}" options:0 error:NULL];
 
     // 按优先级扫描（网络缓存里最可能有 egid= 键值对）
+    // ★ 实测坑：这些文件里 egid= 就在 KSURLCache/Cache.db-wal，
+    //   但它体积大（1.7MB）、且目录下文件多，必须优先扫、单独给配额，
+    //   否则会被前面的小文件耗尽扫描配额而漏掉。
     NSArray *subs = @[
         @"Library/Caches/com.jiangjia.gif/KSURLCache",
         @"Library/Caches/com.jiangjia.gif",
@@ -1499,18 +1504,26 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 
     NSString *bestAny = nil;
     NSMutableDictionary *counter = [NSMutableDictionary dictionary];
-    NSUInteger scanned = 0;
 
     for (NSString *sub in subs) {
         NSString *dir = [[self containerRoot] stringByAppendingPathComponent:sub];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:dir isDirectory:&isDir] || !isDir) continue;
+
+        // 每个目录独立配额（不再全局累加）
+        NSUInteger dirBudget = 300;
+        NSUInteger used = 0;
         NSDirectoryEnumerator *en = [fm enumeratorAtPath:dir];
         for (NSString *rel in en) {
-            if (scanned++ > 400) break;
+            if (used >= dirBudget) break;
             NSString *full = [dir stringByAppendingPathComponent:rel];
-            BOOL isDir = NO;
-            if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+            BOOL fIsDir = NO;
+            if (![fm fileExistsAtPath:full isDirectory:&fIsDir] || fIsDir) continue;
+            used++;
+
             NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
-            if ([attr fileSize] > 8 * 1024 * 1024) continue;
+            // 放宽到 16MB（KSURLCache 的 wal 文件实测 1.7MB 以上）
+            if ([attr fileSize] > 16 * 1024 * 1024) continue;
 
             NSData *data = [NSData dataWithContentsOfFile:full];
             if (!data.length) continue;
@@ -1529,6 +1542,14 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
             if (ms.count) {
                 [KSLog add:@"  %@/%@ 里找到 %lu 个 egid= 键值对",
                  [sub lastPathComponent], rel, (unsigned long)ms.count];
+                // 一命中就可以停：KSURLCache 是权威来源
+                if (sub == subs.firstObject) {
+                    NSString *hit = counter.count ? counter.allKeys.firstObject : nil;
+                    if (hit.length) {
+                        [KSLog add:@"  egid 命中 KSURLCache → %@", hit];
+                        return hit;
+                    }
+                }
             }
 
             // ② 兜底记录：任意 DFP（取出现最多的）
@@ -1614,10 +1635,10 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         BOOL isDir = NO;
         if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
         NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
-        if ([attr fileSize] > 4 * 1024 * 1024) continue;
+        if ([attr fileSize] > 16 * 1024 * 1024) continue;
 
         NSData *data = [NSData dataWithContentsOfFile:full];
-        if (!data || data.length > 4 * 1024 * 1024) continue;
+        if (!data || data.length > 16 * 1024 * 1024) continue;
         // 用 latin-1 解码（日志是二进制+文本混合）
         NSString *s = [[NSString alloc] initWithData:data
                                             encoding:NSISOLatin1StringEncoding];
