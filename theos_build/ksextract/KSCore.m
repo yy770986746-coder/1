@@ -528,7 +528,7 @@ static NSLock *gLock = nil;
 + (NSString *)didFromNetworkCache;
 + (NSDictionary *)loadPlistAt:(NSString *)path;
 + (NSString *)didFromPlistDeep:(NSDictionary *)d;
-+ (NSString *)egidFromContainerScan:(KSTarget *)t;
++ (NSString *)egidFromContainerScan;
 + (NSString *)egidScan:(NSString *)knownDid;
 + (NSString *)containerRoot;
 @end
@@ -1386,10 +1386,11 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 ///   所以只作为【次要】来源，主来源是 didFromNetworkCache。
 + (NSString *)didFromKeychain {
     // 先试快手自己的 access group，再试默认组
+    // 注意：NSArray 字面量里不能写 nil，用 NSNull 占位表示"不指定 group"
     NSArray *groups = @[@"NR2KD6K4TL.com.jiangjia.gif",
                         @"R3Y5DWB26T.com.jiangjia.gif",
                         @"com.jiangjia.gif",
-                        nil];   // nil = 不指定 group（用默认）
+                        [NSNull null]];
     NSArray *services = @[@"CiInfoKey_Re_N", @"EAccountSDKFakeUUID"];
 
     NSRegularExpression *uuidRe =
@@ -1397,7 +1398,8 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
          @"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
           "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}" options:0 error:NULL];
 
-    for (NSString *grp in groups) {
+    for (id gid in groups) {
+        NSString *grp = [gid isKindOfClass:[NSString class]] ? gid : nil;
         for (NSString *svc in services) {
             for (int mode = 0; mode < 2; mode++) {
                 NSMutableDictionary *q = [NSMutableDictionary dictionary];
@@ -1468,14 +1470,10 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     return nil;
 }
 
-/// 扫描容器内的文本文件找 DFP 指纹（参考插件：任意文本里 DFP+40~64hex）
-/// ★ 实测（真机 Cache.db-wal 分析）：
-///   请求参数串里 did 和 egid 同现，形如
-///     "...;did=BEA9D9B2-121F-27F4-CB7B-6FD40BBD4AF6;didTag=0;egid=DFP248629...;gid=DFP248629...;"
-///   而缓存里存在多个历史 DFP（设备每次改机/重置都会生成新的）。
-///   所以判据是：找【与当前 did 出现在同一条请求里】的那个 DFP，而不是随便找一个。
-+ (NSString *)egidFromContainerScan:(KSTarget *)t {
-    return [self egidScan:t.did];
+/// 扫描容器内的文本文件找 egid（DFP 指纹）
+/// 实际逻辑都在 egidScan: 里，这里保留一个无参入口
++ (NSString *)egidFromContainerScan {
+    return [self egidScan:nil];
 }
 
 /// 扫描容器文本文件找 egid
@@ -1556,21 +1554,25 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
             // ① 首选：egid=DFP... 键值对
             NSArray *ms = [egidRe matchesInString:txt options:0
                                             range:NSMakeRange(0, txt.length)];
-            for (NSTextCheckingResult *m in ms) {
-                if (m.numberOfRanges < 2) continue;
-                NSString *v = [txt substringWithRange:[m rangeAtIndex:1]];
-                counter[v] = @([counter[v] integerValue] + 1);
-            }
             if (ms.count) {
                 [KSLog add:@"  %@/%@ 里找到 %lu 个 egid= 键值对",
-                 [sub lastPathComponent], rel, (unsigned long)ms.count];
-                // 一命中就可以停：KSURLCache 是权威来源
+                 [sub lastPathComponent], n, (unsigned long)ms.count];
+                // ★ KSURLCache 是权威来源：直接取本文件里【最后一个】egid=
+                //   （越靠后越新，对应当前活跃设备）
                 if (sub == subs.firstObject) {
-                    NSString *hit = counter.count ? counter.allKeys.firstObject : nil;
-                    if (hit.length) {
-                        [KSLog add:@"  egid 命中 KSURLCache → %@", hit];
-                        return hit;
+                    NSTextCheckingResult *last = ms.lastObject;
+                    if (last.numberOfRanges >= 2) {
+                        NSString *hit = [txt substringWithRange:[last rangeAtIndex:1]];
+                        if (hit.length) {
+                            [KSLog add:@"  egid 命中 KSURLCache → %@", hit];
+                            return hit;
+                        }
                     }
+                }
+                for (NSTextCheckingResult *m in ms) {
+                    if (m.numberOfRanges < 2) continue;
+                    NSString *v = [txt substringWithRange:[m rangeAtIndex:1]];
+                    counter[v] = @([counter[v] integerValue] + 1);
                 }
             }
 
