@@ -516,6 +516,7 @@ static NSLock *gLock = nil;
                              domain:(NSString *)bundleID;
 + (void)flushDaemons;
 + (NSString *)currentFiveLine:(KSTarget *)t;
++ (BOOL)killKuaishouAndWait;
 @end
 
 @implementation KSInjector
@@ -583,16 +584,61 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
             [NSCharacterSet newlineCharacterSet]];
 }
 
-+ (void)killKuaishou {
-    NSString *running = [KSTarget runningProcessName];
-    NSArray *names = running ? @[running] : @[@"com_kwai_gif", @"Kwai", @"com.kuaishou.nebula"];
+/// 彻底结束快手进程，并确认真的退出了
+/// ★ 实测教训：只发一次 killall 是不够的 ——
+///   1) 无根越狱下 killall 可能在 /var/jb/usr/bin/，不能只试 /usr/bin
+///   2) 杀完立刻写 plist，快手可能还没完全退出，会在退出前把内存数据刷回去
+///   3) 必须轮询确认进程消失，否则写进去的键会被覆盖
++ (BOOL)killKuaishouAndWait {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    // 无根越狱（rootless）的二进制在 /var/jb 下，两个路径都要试
+    NSArray *killallPaths = @[
+        @"/var/jb/usr/bin/killall",
+        @"/usr/bin/killall",
+        @"/var/jb/usr/bin/killall5",
+    ];
+    // 快手可能的进程名（主 App + 扩展）
+    NSArray *names = @[
+        @"com_kwai_gif",          // 主进程（com.jiangjia.gif 的可执行名）
+        @"com.kuaishou.nebula",   // 极速版
+        @"Kwai",
+        @"kwaishop",
+    ];
 
-    for (NSString *n in names) {
-        // killall 优先（越狱机 /usr/bin/killall 存在）
-        runCmd(@"/usr/bin/killall", @[@"-9", n]);
+    // 第一轮：全部杀一遍
+    for (NSString *kp in killallPaths) {
+        if (![fm fileExistsAtPath:kp]) continue;
+        for (NSString *n in names) {
+            runCmd(kp, @[@"-9", n]);
+        }
     }
-    [KSLog add:@"已结束快手进程"];
-    usleep(400 * 1000);
+    [KSLog add:@"已发送结束信号"];
+
+    // 轮询等待进程消失，最多 5 秒
+    for (int i = 0; i < 25; i++) {
+        BOOL alive = NO;
+        for (NSString *n in names) {
+            // kill(pid,-1) 不行，用 killall -0 探测
+            for (NSString *kp in killallPaths) {
+                if (![fm fileExistsAtPath:kp]) continue;
+                if (runCmd(kp, @[@"-0", n]) == 0) { alive = YES; break; }
+            }
+            if (alive) break;
+        }
+        if (!alive) {
+            [KSLog add:@"✓ 快手进程已完全退出（%.1f 秒）", (i + 1) * 0.2];
+            usleep(300 * 1000);   // 再等 0.3s 让系统完成资源回收
+            return YES;
+        }
+        usleep(200 * 1000);
+    }
+
+    [KSLog add:@"⚠ 5 秒内进程未退出，写入可能被覆盖"];
+    return NO;
+}
+
++ (void)killKuaishou {
+    [self killKuaishouAndWait];
 }
 
 /// 修正 plist 属主与权限（对标安卓的 chown + chmod + chcon）
@@ -901,8 +947,14 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     }
 
     step(@"[3/6] 结束快手进程...", YES);
-    [self killKuaishou];
-    step(@"  ✓ 已结束", YES);
+    // ★ 必须等到进程真的退出再写 —— 否则快手退出前会把内存里的旧数据刷回 plist，
+    //   把我们写进去的键覆盖掉。这是"有时候能上号、有时候上不去"的主要原因。
+    BOOL killed = [self killKuaishouAndWait];
+    if (killed) {
+        step(@"  ✓ 快手已完全退出", YES);
+    } else {
+        step(@"  ⚠ 进程仍在，尝试继续（可能失败）", NO);
+    }
 
     step(@"[4/6] 清除旧登录态...", YES);
     [self clearLogin:t];
