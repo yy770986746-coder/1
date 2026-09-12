@@ -38,9 +38,10 @@
 
 @property (nonatomic, copy) NSString *token;
 @property (nonatomic, copy) NSString *salt;
-@property (nonatomic, copy) NSString *did;      // uid（32位hex-数字）
-@property (nonatomic, copy) NSString *egid;
-@property (nonatomic, copy) NSString *apiSt;    // api_st（64位hex）
+@property (nonatomic, copy) NSString *did;      // 第3段：设备 ID（UUID）→ WeaponUUIDKey
+@property (nonatomic, copy) NSString *egid;     // 第4段：DFP 设备指纹 → KS_OUTERID_KEY
+@property (nonatomic, copy) NSString *apiSt;    // 第5段：api_st → Gif_ServiceToken
+@property (nonatomic, copy) NSString *userIdFromToken; // 第1段尾部数字（账号 ID）
 @property (nonatomic, copy) NSString *hToken;
 @property (nonatomic, copy) NSString *passToken; // serviceToken（base64 protobuf）
 /// 用户资料（可选，缺失时用安全默认值兜底，避免快手 UI 拿到 nil 崩溃）

@@ -169,13 +169,17 @@ static NSLock *gLock = nil;
          (int)tokenField.length, uid, uidOK ? @"合法" : @"⚠非纯数字",
          saltField, saltOK ? @"合法" : @"⚠非32位hex"];
 
-        f.token = tokenField;      // 第1段：完整 "hex-uid"
+        // ★ 字段映射（用户确认的顺序：token / salt / did / egid / apiSt）
+        f.token = tokenField;      // 第1段：完整 "32位hex-uid"
         f.salt  = saltField;       // 第2段：32位hex
-        f.did   = uid;             // 第1段尾部的数字 uid
-        // 其余段位尽量保留，供备用键写入
-        if (parts.count > 2) f.egid  = parts[2];
-        if (parts.count > 3) f.apiSt = parts[3];
-        if (parts.count > 4) f.passToken = parts[4];
+        //  第3段 = did（UUID），提取器对应 WeaponUUIDKey
+        //  第4段 = egid（DFP 设备指纹）
+        //  第5段 = api_st（base64 protobuf，kuaishou.api.st）
+        if (parts.count > 2) f.did       = parts[2];
+        if (parts.count > 3) f.egid      = parts[3];
+        if (parts.count > 4) f.apiSt     = parts[4];
+        // uid 来自第1段尾部（"hex-uid" 里的 uid）
+        f.userIdFromToken = uid;
         return f;
     }
 
@@ -229,22 +233,21 @@ static NSLock *gLock = nil;
 }
 
 - (NSString *)userId {
-    // 解析阶段已经把 uid 放进 did（纯数字）。直接用它最稳。
+    // uid 是第1段 "32位hex-数字" 里 '-' 之后的数字，解析时已单独存下
     NSRegularExpression *numRe =
         [NSRegularExpression regularExpressionWithPattern:@"^\\d+$"
                                                  options:0 error:NULL];
-    if (self.did.length &&
-        [numRe numberOfMatchesInString:self.did options:0
-                                 range:NSMakeRange(0, self.did.length)]) {
-        return self.did;
+    if (self.userIdFromToken.length &&
+        [numRe numberOfMatchesInString:self.userIdFromToken options:0
+                                 range:NSMakeRange(0, self.userIdFromToken.length)]) {
+        return self.userIdFromToken;
     }
-    // 回退：token 写成 "32位hex-数字" 时，从尾部 '-' 后取
-    for (NSString *cand in @[self.did ?: @"", self.token ?: @""]) {
-        if (!cand.length) continue;
-        NSRange d = [cand rangeOfString:@"-" options:NSBackwardsSearch];
-        if (d.location == NSNotFound) continue;
-        NSString *tail = [cand substringFromIndex:d.location + 1];
-        if (tail.length) return tail;
+    // 回退：直接从 token 尾部取
+    if (self.token.length) {
+        NSRange d = [self.token rangeOfString:@"-" options:NSBackwardsSearch];
+        if (d.location != NSNotFound && d.location + 1 < self.token.length) {
+            return [self.token substringFromIndex:d.location + 1];
+        }
     }
     return @"未知";
 }
@@ -512,7 +515,6 @@ static NSLock *gLock = nil;
                                path:(NSString *)prefsPath
                              domain:(NSString *)bundleID;
 + (void)flushDaemons;
-+ (BOOL)writeDID:(NSString *)did target:(KSTarget *)t;
 @end
 
 @implementation KSInjector
@@ -577,71 +579,6 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     [fm setAttributes:@{NSFilePosixPermissions: @(0755)} ofItemAtPath:dir error:NULL];
 
     return YES;
-}
-
-/// 写入 did（设备标识）到快手容器
-/// 实测路径：<容器>/Library/Application Support/com.kuaishou.did
-/// 内容是 36 字节纯文本 UUID，如 4C96E59A-0F12-47E8-B56B-FFB036C694CB
-/// 必须与 token 配套：token 是源设备签发的，did 也必须是源设备的，
-/// 否则服务器判定设备不匹配 → 登录态失效 / 功能闪退。
-+ (BOOL)writeDID:(NSString *)did target:(KSTarget *)t {
-    if (!did.length) {
-        [KSLog add:@"⚠ did 为空，跳过"];
-        return NO;
-    }
-    // 必须是标准 UUID 格式
-    NSRegularExpression *uuidRe =
-        [NSRegularExpression regularExpressionWithPattern:
-         @"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
-          "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$" options:0 error:NULL];
-    if (![uuidRe numberOfMatchesInString:did options:0
-                                   range:NSMakeRange(0, did.length)]) {
-        [KSLog add:@"⚠ did 格式不是标准 UUID，跳过: %@", did];
-        return NO;
-    }
-
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *base = [t.dataContainer stringByAppendingPathComponent:
-                      @"Library/Application Support"];
-    if (![fm fileExistsAtPath:base]) {
-        [KSLog add:@"⚠ 目录不存在: %@", base];
-        return NO;
-    }
-    NSString *didPath = [base stringByAppendingPathComponent:@"com.kuaishou.did"];
-
-    // 读旧值做记录
-    NSString *old = [NSString stringWithContentsOfFile:didPath
-                                             encoding:NSUTF8StringEncoding
-                                                error:NULL];
-    [KSLog add:@"did 旧值: %@", old.length ? old : @"(无)"];
-
-    // 备份一次（只在首次备份，避免覆盖掉最初的原始值）
-    NSString *bak = [didPath stringByAppendingString:@".ksbak"];
-    if (![fm fileExistsAtPath:bak] && old.length) {
-        [fm copyItemAtPath:didPath toPath:bak error:NULL];
-    }
-
-    // 写入（不带换行，和设备原格式一致）
-    NSError *we = nil;
-    BOOL ok = [did writeToFile:didPath atomically:YES
-                      encoding:NSUTF8StringEncoding error:&we];
-    if (!ok) {
-        [KSLog add:@"✗ did 写入失败: %@", we.localizedDescription];
-        return NO;
-    }
-    [fm setAttributes:@{NSFilePosixPermissions: @(0644)}
-         ofItemAtPath:didPath error:NULL];
-    [self fixOwnership:didPath target:t];
-
-    NSString *now = [NSString stringWithContentsOfFile:didPath
-                                             encoding:NSUTF8StringEncoding
-                                                error:NULL];
-    if ([now isEqualToString:did]) {
-        [KSLog add:@"✓ did 已写入: %@", now];
-        return YES;
-    }
-    [KSLog add:@"✗ did 校验失败，读回: %@", now ?: @"(nil)"];
-    return NO;
 }
 
 + (BOOL)writeOnly:(KSFive *)five target:(KSTarget *)t {
@@ -710,23 +647,35 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
 
     NSString *uid = [five userId];
 
-    // === 核心登录键 ===
-    // ★ 类型严格对齐「已登录真机实测快照」：
-    //   Gif_Token          str  "32位hex-uid"
-    //   Gif_Token_Salt     str  32位hex
-    //   Gif_KwaiClientSalt str  与 Token_Salt 同值
-    //   Gif_ID             int  ← 不是字符串！
-    //   Gif_LastLoginType  str  "phone_captcha_login" ← 不是 "1"！
-    //   Gif_Kwai_New_User  bool ← 不是 "0"！
-    put(@"Gif_Token",          five.token);
-    put(@"Gif_Token_Salt",     five.salt);
-    put(@"Gif_KwaiClientSalt", five.salt);
+    // === 核心登录键：严格对齐「五参提取器」的取数逻辑 ===
+    // 提取器（快手五参提取.py）从 plist 读这几个键来生成五参：
+    //     Gif_Token                                 → 第1段
+    //     Gif_Token_Salt  / Gif_KwaiClientSalt      → 第2段
+    //     KLink_Persistent_klink.device_id / WeaponUUIDKey → 第3段 (did)
+    //     (日志 global_id=DFP)                       → 第4段 (egid)
+    //     Gif_ServiceToken                          → 第5段 (api_st)
+    // 所以写入时也必须落在这几个键上，写别处快手读不到。
+    put(@"Gif_Token",          five.token);   // 第1段：完整 "32位hex-uid"
+    put(@"Gif_Token_Salt",     five.salt);    // 第2段
+    put(@"Gif_KwaiClientSalt", five.salt);    // 与 Salt 同值（真机实测一致）
 
-    // uid 写成整型（真机实测 Gif_ID 是 int 类型 4188087200）
+    // ★ did（第3段）：提取器读的是 WeaponUUIDKey，
+    //   iOS 快手判定"设备身份"用的就是这个键。
+    //   之前我误写到 com.kuaishou.did 文件里，那个文件不是登录判定依据。
+    if (five.did.length) {
+        put(@"WeaponUUIDKey", five.did);
+    }
+
+    // egid（第4段）：DFP 设备指纹
+    if (five.egid.length) {
+        put(@"KS_OUTERID_KEY", five.egid);
+    }
+
+    // uid 写成整型（真机实测 Gif_ID 是 int 类型）
     NSInteger uidNum = (NSInteger)[uid longLongValue];
-    putI(@"Gif_ID", uidNum > 0 ? uidNum : 0);
+    if (uidNum > 0) putI(@"Gif_ID", uidNum);
 
-    // 登录类型：真机值是 phone_captcha_login（手机验证码登录）
+    // 登录类型：真机值是 phone_captcha_login
     put(@"Gif_LastLoginType",  @"phone_captcha_login");
     putB(@"Gif_Kwai_New_User", NO);      // 老用户 = 布尔 NO
 
@@ -924,17 +873,11 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     }
     step(@"  ✓ 写入成功", YES);
 
-    // did 必须和 token 配套：token 是源设备签发的，did 也必须是源设备的
-    step(@"[5.5/6] 同步设备标识 did...", YES);
-    NSString *did = five.did;
-    if (did.length) {
-        if ([self writeDID:did target:t]) {
-            step([NSString stringWithFormat:@"  ✓ did = %@", did], YES);
-        } else {
-            step(@"  ⚠ did 写入失败（登录可能仍生效，但功能可能受限）", NO);
-        }
-    } else {
-        step(@"  ⚠ 参数里没有 did（第3段），跳过", NO);
+    // did/egid 已在 writeOnly: 里作为 WeaponUUIDKey / KS_OUTERID_KEY 写入 plist，
+    // 不再单独写 com.kuaishou.did 文件 —— 实测那个文件不是登录判定依据，
+    // 真正被读取的是 WeaponUUIDKey（五参提取器也是从它取值）。
+    if (five.did.length) {
+        step([NSString stringWithFormat:@"  ✓ did(WeaponUUIDKey) = %@", five.did], YES);
     }
 
     step(@"[6/6] 拉起快手...", YES);
