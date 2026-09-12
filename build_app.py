@@ -35,7 +35,15 @@ DISPLAY_NAME = "快手上号器"
 BUNDLE_ID = "com.kuaishou.ioslogin"
 VERSION = "1.0.0"
 PKG_ID = "com.kuaishou.ioslogin"
-ARCH = "iphoneos-arm64"
+
+# deb 架构字段。
+# 注意：设备 dpkg 的「system arch」在新机上常显示 iphoneos-arm64e，
+# 若包声明 iphoneos-arm64，dpkg -i 会直接拒绝：
+#   package architecture (iphoneos-arm64) does not match system (iphoneos-arm64e)
+# 而编出来的 Mach-O 实际是 arm64（arm64e 系统可正常执行 arm64）。
+# 所以这里用 iphoneos-arm64e 以通过 dpkg 校验；Sileo 两种都接受。
+# 可用环境变量 KS_DEB_ARCH 覆盖。
+ARCH = os.environ.get("KS_DEB_ARCH", "iphoneos-arm64e")
 
 # 无根越狱安装前缀
 JB_ROOT = "/var/jb"

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """验证 --pack 产出的 deb 是否真的包含编译产物"""
 import io
 import os
@@ -9,7 +9,7 @@ import io as _io
 sys.stdout = _io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 ROOT = r"C:\Users\yyds\Desktop\ios快手上号器"
-deb = os.path.join(ROOT, "build", "ks_KSExtract_1.0.0_iphoneos-arm64_FULL.deb")
+deb = os.path.join(ROOT, "build", "ks_KSExtract_1.0.0_iphoneos-arm64e_FULL.deb")
 
 if not os.path.exists(deb):
     print("FAIL: deb 不存在")
