@@ -593,17 +593,30 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 ///   因为快手进程不在 mobile 的可见范围内。
 ///   唯一可靠的方式是用 launchctl list 拿到 PID，再 kill -9。
 + (pid_t)pidFromLaunchctlForBundle:(NSString *)bundleID {
-    NSArray *lines = runCmdCapture(@"/bin/launchctl", @[@"list"]);
-    if (!lines.count) {
-        lines = runCmdCapture(@"/usr/bin/launchctl", @[@"list"]);
+    // ★ 实测坑：/bin/launchctl 是个【相对符号链接】 -> ".jbroot/usr/bin/launchctl"
+    //   无根越狱下这个相对链接在 App 沙盒里解析不了，必须直接用真实路径。
+    NSArray *paths = @[
+        @"/usr/bin/launchctl",        // 真实二进制（首选）
+        @"/var/jb/usr/bin/launchctl",
+        @"/bin/launchctl",
+    ];
+    NSArray *lines = nil;
+    NSString *usedPath = nil;
+    for (NSString *p in paths) {
+        lines = runCmdCapture(p, @[@"list"]);
+        if (lines.count) { usedPath = p; break; }
     }
+    if (!lines.count) {
+        [KSLog add:@"  ⚠ launchctl 无输出（所有路径都试过）"];
+        return 0;
+    }
+    if (usedPath) [KSLog add:@"  使用 %@ 查进程", usedPath];
+
     // 目标行格式： 42405	0	UIKitApplication:com.jiangjia.gif[035a][rb-legacy]
     NSString *needle = [NSString stringWithFormat:@"UIKitApplication:%@", bundleID];
     for (NSString *l in lines) {
         if (![l containsString:needle]) continue;
-        // 取行首数字
         NSCharacterSet *ws = [NSCharacterSet whitespaceCharacterSet];
-        NSRange r = NSMakeRange(0, l.length);
         NSUInteger i = 0;
         while (i < l.length && [ws characterIsMember:[l characterAtIndex:i]]) i++;
         NSUInteger start = i;
@@ -1196,82 +1209,85 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 }
 
 + (BOOL)wipeAllData:(KSTarget *)t {
-    if (!t.dataContainer) return NO;
+    if (!t.dataContainer) {
+        [KSLog add:@"✗ 未定位到容器"];
+        return NO;
+    }
 
-    [self killKuaishou];
+    // ★ 第一步必须是杀进程，而且确认真的退出（用 launchctl 取 PID 强杀）
+    [KSLog add:@"  ① 结束快手进程..."];
+    BOOL killed = [self killKuaishouAndWait];
+    [KSLog add:@"     %@", killed ? @"✓ 已退出" : @"⚠ 未能确认退出"];
 
     NSFileManager *fm = [NSFileManager defaultManager];
-
-    // ★ 关键：快手的登录/账号数据不只在 Library，还散落在 Documents 下。
-    //   实测这些目录都含登录态：
-    //     Documents/mmkv/          （键值库，kswitchesVerKey.<uid> 等）
-    //     Documents/imsdk/<uid>/   （私信数据库，目录名就是 uid）
-    //     Documents/imdata/<uid>/  （用户信息 sqlite）
-    //     Library/Preferences/     （com.jiangjia.gif.plist 主登录键）
-    //     Library/KSKVCache/       （账号 KV）
-    //     Library/Cookies WebKit   （网页登录态）
-    //   只清 Library 是不够的 —— 这正是之前"点了清空但快手没变化"的原因。
-    NSArray *subs = @[
-        @"Library/Preferences",
-        @"Library/Caches",
-        @"Library/Cookies",
-        @"Library/WebKit",
-        @"Library/HTTPStorages",
-        @"Library/KSKVCache",
-        @"Library/Saved Application State",
-        @"Documents/mmkv",
-        @"Documents/imsdk",
-        @"Documents/imdata",
-        @"Documents/com.hawkeye.data",
-        @"Documents/com.kuaishou.eve.db",
-        @"Documents/ksdownload",
-    ];
-
     NSUInteger total = 0;
-    for (NSString *s in subs) {
-        NSString *p = [t.dataContainer stringByAppendingPathComponent:s];
-        BOOL isDir = NO;
-        if (![fm fileExistsAtPath:p isDirectory:&isDir]) continue;
 
-        NSArray *items = [fm contentsOfDirectoryAtPath:p error:NULL];
-        NSUInteger ok = 0;
-        for (NSString *it in items) {
-            if ([fm removeItemAtPath:[p stringByAppendingPathComponent:it]
-                               error:NULL]) ok++;
+    // ★★ 直接清空整个容器内容（用户要求：像改机工具那样全清）
+    //    保留容器目录本身，只删里面所有条目 —— 这样 iOS 仍认得容器，
+    //    但快手下次启动会当成全新安装。
+    [KSLog add:@"  ② 清空容器内容: %@", t.dataContainer];
+
+    NSError *dirErr = nil;
+    NSArray *tops = [fm contentsOfDirectoryAtPath:t.dataContainer error:&dirErr];
+    if (!tops) {
+        [KSLog add:@"     ⚠ 读取容器失败: %@", dirErr.localizedDescription];
+    } else {
+        [KSLog add:@"     容器内有 %lu 个条目", (unsigned long)tops.count];
+        for (NSString *item in tops) {
+            // .com.apple.mobile_container_manager.metadata.plist 是容器元数据，
+            // 删掉会导致容器失效，必须保留
+            if ([item isEqualToString:
+                 @".com.apple.mobile_container_manager.metadata.plist"]) continue;
+
+            NSString *p = [t.dataContainer stringByAppendingPathComponent:item];
+            NSError *e = nil;
+            if ([fm removeItemAtPath:p error:&e]) {
+                total++;
+            } else {
+                [KSLog add:@"     ✗ %@ → %@", item, e.localizedDescription];
+            }
         }
-        total += ok;
-        [KSLog add:@"  清理 %-32@ %lu/%lu", s, (unsigned long)ok,
-         (unsigned long)items.count];
     }
 
     // AppGroup 共享容器（group.com.kwai.video）里也有账号痕迹
     NSArray *groups = [self appGroupContainers];
     for (NSString *g in groups) {
-        NSString *p = [g stringByAppendingPathComponent:@"Library/Preferences"];
-        NSArray *items = [fm contentsOfDirectoryAtPath:p error:NULL];
+        NSError *ge = nil;
+        NSArray *items = [fm contentsOfDirectoryAtPath:g error:&ge];
+        if (!items) continue;
         NSUInteger ok = 0;
         for (NSString *it in items) {
-            if ([fm removeItemAtPath:[p stringByAppendingPathComponent:it]
+            if ([it isEqualToString:
+                 @".com.apple.mobile_container_manager.metadata.plist"]) continue;
+            if ([fm removeItemAtPath:[g stringByAppendingPathComponent:it]
                                error:NULL]) ok++;
         }
         total += ok;
-        if (items.count) {
-            [KSLog add:@"  清理 AppGroup Preferences %lu 项", (unsigned long)ok];
+        if (ok) {
+            [KSLog add:@"     清理 AppGroup(%@) %lu 项",
+             [g lastPathComponent], (unsigned long)ok];
         }
     }
 
-    [KSLog add:@"  合计清理 %lu 项", (unsigned long)total];
+    [KSLog add:@"  ③ 合计清理 %lu 项", (unsigned long)total];
 
-    // 清完必须刷新 cfprefsd，否则它会用内存缓存把文件写回来
+    // 清完刷新守护进程缓存，防它把内存数据写回
     [self flushDaemons];
+    [KSLog add:@"  ④ 已刷新 cfprefsd 缓存"];
 
-    // 校验：主 plist 是否真的被清掉
-    if (t.prefsPath) {
-        NSDictionary *after = [NSDictionary dictionaryWithContentsOfFile:t.prefsPath];
-        if (after.count == 0) {
-            [KSLog add:@"  ✓ 主 plist 已清空"];
-        } else {
-            [KSLog add:@"  ⚠ 主 plist 仍有 %lu 个键", (unsigned long)after.count];
+    // ★ 校验：容器应该基本为空了
+    NSArray *after = [fm contentsOfDirectoryAtPath:t.dataContainer error:NULL];
+    NSUInteger remain = 0;
+    for (NSString *x in after) {
+        if (![x isEqualToString:
+              @".com.apple.mobile_container_manager.metadata.plist"]) remain++;
+    }
+    if (remain == 0) {
+        [KSLog add:@"  ✓ 容器已清空"];
+    } else {
+        [KSLog add:@"  ⚠ 容器还剩 %lu 个条目（可能有进程占用）", (unsigned long)remain];
+        for (NSString *x in after) {
+            if (![x hasPrefix:@"."]) [KSLog add:@"      残留: %@", x];
         }
     }
     return YES;
