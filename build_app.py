@@ -743,38 +743,85 @@ def _make_ar(members):
     return buf.getvalue()
 
 
-def _make_icon_png(size=120):
-    """生成一个简单的 App 图标（橙底 + 白色闪电），避免桌面白板"""
-    try:
-        from PIL import Image, ImageDraw
-    except ImportError:
-        return None
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    # 圆角橙底
-    r = int(size * 0.22)
-    d.rounded_rectangle([0, 0, size - 1, size - 1], radius=r, fill=(255, 122, 0, 255))
-    # 白色闪电
-    s = size / 100.0
-    bolt = [(58, 12), (30, 56), (48, 56), (40, 88), (70, 42), (51, 42)]
-    d.polygon([(x * s, y * s) for x, y in bolt], fill=(255, 255, 255, 255))
-    return img
+def _png_bytes(size, rgba_fill, bolt=True):
+    """不依赖 Pillow 生成一个简单 PNG（纯 Python，用 zlib）"""
+    import zlib, struct
+
+    # 像素缓冲：每行前面 1 字节 filter
+    w = h = size
+    rows = []
+    r, g, b, a = rgba_fill
+    # 圆角半径
+    rad = int(size * 0.22)
+    for y in range(h):
+        row = bytearray([0])  # filter type 0
+        for x in range(w):
+            # 圆角裁切
+            inside = True
+            if x < rad and y < rad:
+                inside = (rad - x) ** 2 + (rad - y) ** 2 <= rad * rad
+            elif x >= w - rad and y < rad:
+                inside = (x - (w - rad - 1)) ** 2 + (rad - y) ** 2 <= rad * rad
+            elif x < rad and y >= h - rad:
+                inside = (rad - x) ** 2 + (y - (h - rad - 1)) ** 2 <= rad * rad
+            elif x >= w - rad and y >= h - rad:
+                inside = (x - (w - rad - 1)) ** 2 + (y - (h - rad - 1)) ** 2 <= rad * rad
+
+            # 闪电形状（归一化坐标）
+            px, py = x * 100.0 / size, y * 100.0 / size
+            in_bolt = False
+            if bolt and inside:
+                poly = [(58, 12), (30, 56), (48, 56), (40, 88), (70, 42), (51, 42)]
+                n = len(poly)
+                j = n - 1
+                for i in range(n):
+                    xi, yi = poly[i]
+                    xj, yj = poly[j]
+                    if ((yi > py) != (yj > py)) and \
+                       (px < (xj - xi) * (py - yi) / float(yj - yi) + xi):
+                        in_bolt = not in_bolt
+                    j = i
+
+            if not inside:
+                row += bytes((0, 0, 0, 0))
+            elif in_bolt:
+                row += bytes((255, 255, 255, 255))
+            else:
+                row += bytes((r, g, b, a))
+        rows.append(bytes(row))
+
+    raw = b"".join(rows)
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        c += struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        return c
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(raw, 9))
+    png += chunk(b"IEND", b"")
+    return png
 
 
 def _write_icons(app_dir):
-    """把图标写进 .app，返回是否成功"""
-    img = _make_icon_png(120)
-    if img is None:
-        return False
+    """把图标写进 .app（不依赖 Pillow），返回是否成功"""
     try:
-        # 现代命名（配合 CFBundleIconFiles 里的 AppIcon60x60）
-        img.resize((120, 120)).save(os.path.join(app_dir, "AppIcon60x60@2x.png"))
-        img.resize((60, 60)).save(os.path.join(app_dir, "AppIcon60x60@1x.png"))
-        img.resize((180, 180)).save(os.path.join(app_dir, "AppIcon60x60@3x.png"))
-        img.resize((76, 76)).save(os.path.join(app_dir, "AppIcon76x76@1x.png"))
-        img.resize((152, 152)).save(os.path.join(app_dir, "AppIcon76x76@2x.png"))
+        base = _png_bytes(120, (255, 122, 0, 255))
+        # CFBundleIconFiles 里声明的是 AppIcon60x60，所以要生成各倍图
+        targets = {
+            "AppIcon60x60@1x.png": 60,
+            "AppIcon60x60@2x.png": 120,
+            "AppIcon60x60@3x.png": 180,
+            "AppIcon76x76@1x.png": 76,
+            "AppIcon76x76@2x.png": 152,
+        }
+        for name, sz in targets.items():
+            with open(os.path.join(app_dir, name), "wb") as f:
+                f.write(_png_bytes(sz, (255, 122, 0, 255)))
         return True
-    except Exception:
+    except Exception as e:
+        print("[图标] 生成失败: %s" % e)
         return False
 
 
