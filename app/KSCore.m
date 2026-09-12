@@ -14,6 +14,7 @@
 #import <sys/types.h>
 #import <spawn.h>
 #import <signal.h>
+#import <errno.h>
 #import <dlfcn.h>
 #import <stdlib.h>
 #import <unistd.h>
@@ -517,6 +518,8 @@ static NSLock *gLock = nil;
 + (void)flushDaemons;
 + (NSString *)currentFiveLine:(KSTarget *)t;
 + (BOOL)killKuaishouAndWait;
++ (pid_t)pidFromLaunchctlForBundle:(NSString *)bundleID;
++ (BOOL)killPID:(pid_t)pid;
 @end
 
 @implementation KSInjector
@@ -584,56 +587,90 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
             [NSCharacterSet newlineCharacterSet]];
 }
 
-/// 彻底结束快手进程，并确认真的退出了
-/// ★ 实测教训：只发一次 killall 是不够的 ——
-///   1) 无根越狱下 killall 可能在 /var/jb/usr/bin/，不能只试 /usr/bin
-///   2) 杀完立刻写 plist，快手可能还没完全退出，会在退出前把内存数据刷回去
-///   3) 必须轮询确认进程消失，否则写进去的键会被覆盖
-+ (BOOL)killKuaishouAndWait {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    // 无根越狱（rootless）的二进制在 /var/jb 下，两个路径都要试
-    NSArray *killallPaths = @[
-        @"/var/jb/usr/bin/killall",
-        @"/usr/bin/killall",
-        @"/var/jb/usr/bin/killall5",
-    ];
-    // 快手可能的进程名（主 App + 扩展）
-    NSArray *names = @[
-        @"com_kwai_gif",          // 主进程（com.jiangjia.gif 的可执行名）
-        @"com.kuaishou.nebula",   // 极速版
-        @"Kwai",
-        @"kwaishop",
-    ];
-
-    // 第一轮：全部杀一遍
-    for (NSString *kp in killallPaths) {
-        if (![fm fileExistsAtPath:kp]) continue;
-        for (NSString *n in names) {
-            runCmd(kp, @[@"-9", n]);
+/// 从 launchctl 取出指定 bundleID 的进程 PID
+/// ★ 实测：killall 在 App 内（mobile 身份）完全无效 ——
+///   实测返回 "No matching processes belonging to you were found"，
+///   因为快手进程不在 mobile 的可见范围内。
+///   唯一可靠的方式是用 launchctl list 拿到 PID，再 kill -9。
++ (pid_t)pidFromLaunchctlForBundle:(NSString *)bundleID {
+    NSArray *lines = runCmdCapture(@"/bin/launchctl", @[@"list"]);
+    if (!lines.count) {
+        lines = runCmdCapture(@"/usr/bin/launchctl", @[@"list"]);
+    }
+    // 目标行格式： 42405	0	UIKitApplication:com.jiangjia.gif[035a][rb-legacy]
+    NSString *needle = [NSString stringWithFormat:@"UIKitApplication:%@", bundleID];
+    for (NSString *l in lines) {
+        if (![l containsString:needle]) continue;
+        // 取行首数字
+        NSCharacterSet *ws = [NSCharacterSet whitespaceCharacterSet];
+        NSRange r = NSMakeRange(0, l.length);
+        NSUInteger i = 0;
+        while (i < l.length && [ws characterIsMember:[l characterAtIndex:i]]) i++;
+        NSUInteger start = i;
+        while (i < l.length &&
+               [[NSCharacterSet decimalDigitCharacterSet]
+                characterIsMember:[l characterAtIndex:i]]) i++;
+        if (i > start) {
+            NSString *num = [l substringWithRange:NSMakeRange(start, i - start)];
+            return (pid_t)[num intValue];
         }
     }
-    [KSLog add:@"已发送结束信号"];
+    return 0;
+}
 
-    // 轮询等待进程消失，最多 5 秒
+/// 用 PID 强杀进程（比 killall 可靠得多）
++ (BOOL)killPID:(pid_t)pid {
+    if (pid <= 0) return NO;
+    return (kill(pid, SIGKILL) == 0);
+}
+
+/// 彻底结束快手进程，并确认真的退出了
++ (BOOL)killKuaishouAndWait {
+    NSArray *bids = @[@"com.jiangjia.gif", @"com.kuaishou.nebula"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *killallPaths = @[@"/var/jb/usr/bin/killall", @"/usr/bin/killall"];
+
+    // ---- 第 1 轮：launchctl 取 PID → kill -9（主力方案）----
+    BOOL didKill = NO;
+    for (NSString *bid in bids) {
+        pid_t pid = [self pidFromLaunchctlForBundle:bid];
+        if (pid > 0) {
+            [KSLog add:@"  发现 %@ PID=%d", bid, (int)pid];
+            if ([self killPID:pid]) {
+                [KSLog add:@"  ✓ kill -9 %d 已发送", (int)pid];
+                didKill = YES;
+            } else {
+                [KSLog add:@"  ⚠ kill -9 %d 失败（errno=%d）", (int)pid, errno];
+            }
+        }
+    }
+
+    // ---- 第 2 轮：killall 兜底（对老版本/其他进程名有效）----
+    NSArray *names = @[@"com_kwai_gif", @"com.kuaishou.nebula", @"Kwai"];
+    for (NSString *kp in killallPaths) {
+        if (![fm fileExistsAtPath:kp]) continue;
+        for (NSString *n in names) runCmd(kp, @[@"-9", n]);
+    }
+
+    if (!didKill) {
+        [KSLog add:@"  未从 launchctl 找到快手进程（可能本来就没运行）"];
+    }
+
+    // ---- 轮询确认：launchctl 里不再出现该 bundle ----
     for (int i = 0; i < 25; i++) {
         BOOL alive = NO;
-        for (NSString *n in names) {
-            // kill(pid,-1) 不行，用 killall -0 探测
-            for (NSString *kp in killallPaths) {
-                if (![fm fileExistsAtPath:kp]) continue;
-                if (runCmd(kp, @[@"-0", n]) == 0) { alive = YES; break; }
-            }
-            if (alive) break;
+        for (NSString *bid in bids) {
+            if ([self pidFromLaunchctlForBundle:bid] > 0) { alive = YES; break; }
         }
         if (!alive) {
-            [KSLog add:@"✓ 快手进程已完全退出（%.1f 秒）", (i + 1) * 0.2];
-            usleep(300 * 1000);   // 再等 0.3s 让系统完成资源回收
+            [KSLog add:@"✓ 快手已完全退出（%.1f 秒）", (i + 1) * 0.2];
+            usleep(400 * 1000);   // 再等 0.4s 让系统完成后台数据落盘
             return YES;
         }
         usleep(200 * 1000);
     }
 
-    [KSLog add:@"⚠ 5 秒内进程未退出，写入可能被覆盖"];
+    [KSLog add:@"⚠ 5 秒内快手仍未退出，写入可能被覆盖"];
     return NO;
 }
 
