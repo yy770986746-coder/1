@@ -1335,16 +1335,27 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         BOOL dIsDir = NO;
         if (![fm fileExistsAtPath:dir isDirectory:&dIsDir] || !dIsDir) continue;
 
-        NSUInteger used = 0, budget = 300;
-        NSDirectoryEnumerator *en = [fm enumeratorAtPath:dir];
-        for (NSString *rel in en) {
+        // 只列当前层，优先 -wal / Cache.db（与 egidScan 一致的策略）
+        NSArray *entries = [fm contentsOfDirectoryAtPath:dir error:NULL];
+        NSMutableArray *ordered = [NSMutableArray array];
+        for (NSString *n in entries) {
+            if ([n hasSuffix:@"-wal"]) [ordered insertObject:n atIndex:0];
+            else if ([n hasPrefix:@"Cache.db"]) [ordered addObject:n];
+        }
+        for (NSString *n in entries) {
+            if (![ordered containsObject:n]) [ordered addObject:n];
+        }
+
+        NSUInteger used = 0, budget = 200;
+        for (NSString *n in ordered) {
             if (used >= budget) break;
-            NSString *full = [dir stringByAppendingPathComponent:rel];
+            NSString *full = [dir stringByAppendingPathComponent:n];
             BOOL isDir = NO;
             if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
             used++;
             NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
             if ([attr fileSize] > 16 * 1024 * 1024) continue;
+            if ([attr fileSize] == 0) continue;
 
             NSData *data = [NSData dataWithContentsOfFile:full];
             if (!data.length) continue;
@@ -1490,16 +1501,18 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
          @"DFP[0-9A-Fa-f]{40,64}" options:0 error:NULL];
 
     // 按优先级扫描（网络缓存里最可能有 egid= 键值对）
-    // ★ 实测坑：这些文件里 egid= 就在 KSURLCache/Cache.db-wal，
-    //   但它体积大（1.7MB）、且目录下文件多，必须优先扫、单独给配额，
-    //   否则会被前面的小文件耗尽扫描配额而漏掉。
+    // ★ 实测坑（真机复现两次）：
+    //   egid= 就在 <容器>/Library/Caches/com.jiangjia.gif/KSURLCache/Cache.db-wal
+    //   （2.2MB，权限 rw-r--r--，App 可读，内含 114 个 egid=）。
+    //   但用 enumeratorAtPath: 会【递归进入 fsCachedData 子目录】，
+    //   那里的海量小文件会耗尽扫描配额，导致 Cache.db-wal 根本轮不到。
+    //   → 改为：只列当前目录（不递归），并优先处理名字里带 -wal / Cache.db 的文件。
     NSArray *subs = @[
         @"Library/Caches/com.jiangjia.gif/KSURLCache",
         @"Library/Caches/com.jiangjia.gif",
         @"Library/vadar",
         @"Library/Caches/ObiwanLogs",
         @"Documents/mmkv",
-        @"Library/Caches",
     ];
 
     NSString *bestAny = nil;
@@ -1510,20 +1523,29 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         BOOL isDir = NO;
         if (![fm fileExistsAtPath:dir isDirectory:&isDir] || !isDir) continue;
 
-        // 每个目录独立配额（不再全局累加）
-        NSUInteger dirBudget = 300;
-        NSUInteger used = 0;
-        NSDirectoryEnumerator *en = [fm enumeratorAtPath:dir];
-        for (NSString *rel in en) {
-            if (used >= dirBudget) break;
-            NSString *full = [dir stringByAppendingPathComponent:rel];
+        // 只列当前层（非递归），按优先级排序：-wal > Cache.db > 其他
+        NSArray *entries = [fm contentsOfDirectoryAtPath:dir error:NULL];
+        NSMutableArray *ordered = [NSMutableArray array];
+        for (NSString *n in entries) {
+            if ([n hasSuffix:@"-wal"]) [ordered insertObject:n atIndex:0];
+            else if ([n hasPrefix:@"Cache.db"]) [ordered addObject:n];
+        }
+        for (NSString *n in entries) {
+            if (![ordered containsObject:n]) [ordered addObject:n];
+        }
+
+        NSUInteger used = 0, budget = 200;
+        for (NSString *n in ordered) {
+            if (used >= budget) break;
+            NSString *full = [dir stringByAppendingPathComponent:n];
             BOOL fIsDir = NO;
             if (![fm fileExistsAtPath:full isDirectory:&fIsDir] || fIsDir) continue;
             used++;
 
             NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
-            // 放宽到 16MB（KSURLCache 的 wal 文件实测 1.7MB 以上）
+            // 放宽到 16MB（KSURLCache 的 wal 文件实测 2.2MB）
             if ([attr fileSize] > 16 * 1024 * 1024) continue;
+            if ([attr fileSize] == 0) continue;
 
             NSData *data = [NSData dataWithContentsOfFile:full];
             if (!data.length) continue;
