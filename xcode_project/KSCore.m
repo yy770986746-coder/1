@@ -5,6 +5,8 @@
 
 #import "KSCore.h"
 #import <UIKit/UIKit.h>
+#import <Foundation/Foundation.h>
+#import <CoreFoundation/CoreFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <sys/stat.h>
@@ -450,6 +452,12 @@ static NSLock *gLock = nil;
 
 #pragma mark - ========== 注入引擎 ==========
 
+@interface KSInjector ()
++ (NSUInteger)writeViaCFPreferences:(NSDictionary *)kv
+                               path:(NSString *)prefsPath
+                             domain:(NSString *)bundleID;
+@end
+
 @implementation KSInjector
 
 /// 用 posix_spawn 调系统命令（越狱机上 App 有权限时可用）
@@ -597,19 +605,28 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     }
 
     // ---- 落盘 ----
-    // 先写临时文件再原子替换，避免写一半损坏（快手有 plist 完整性检查时的保险）
+    // ★ iOS 上直接改 plist 文件会被 cfprefsd 覆盖（它内存里有缓存，
+    //   重启后按缓存重建文件，把我们的写入冲掉）。
+    //   正确路径：通过 CFPreferences 接口写，让 cfprefsd 自己落盘。
+    NSUInteger cfOK = [self writeViaCFPreferences:plist
+                                             path:t.prefsPath
+                                           domain:t.bundleID];
+    [KSLog add:@"CFPreferences 写入 %lu 个键", (unsigned long)cfOK];
+
+    // 文件写入作为兜底（cfprefsd 不可用 / 权限受限时仍可能生效）
     NSString *tmp = [t.prefsPath stringByAppendingString:@".ks_tmp"];
     BOOL ok = [plist writeToFile:tmp atomically:YES];
     if (!ok) {
-        [KSLog add:@"✗ plist 写入失败（沙盒权限不足？）"];
-        return NO;
-    }
-    [fm removeItemAtPath:t.prefsPath error:NULL];
-    NSError *mvErr = nil;
-    [fm moveItemAtPath:tmp toPath:t.prefsPath error:&mvErr];
-    if (mvErr) {
-        [KSLog add:@"✗ 替换 plist 失败: %@", mvErr.localizedDescription];
-        return NO;
+        [KSLog add:@"⚠ plist 文件写入失败（沙盒权限不足？），仅依赖 CFPreferences"];
+    } else {
+        [fm removeItemAtPath:t.prefsPath error:NULL];
+        NSError *mvErr = nil;
+        [fm moveItemAtPath:tmp toPath:t.prefsPath error:&mvErr];
+        if (mvErr) {
+            [KSLog add:@"⚠ 替换 plist 文件失败: %@", mvErr.localizedDescription];
+        } else {
+            [KSLog add:@"✓ plist 文件已写入"];
+        }
     }
 
     [KSLog add:@"✓ 已写入 %lu 个登录键", (unsigned long)n];
@@ -617,12 +634,40 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
 
     [self fixOwnership:t.prefsPath target:t];
 
-    // 清掉可能干扰的缓存
-    NSString *cfprefsd = [@"/usr/bin/killall" copy];
-    runCmd(cfprefsd, @[@"-9", @"cfprefsd"]);
+    // 刷新 cfprefsd 缓存（让它把内存里的新值同步到磁盘）
+    runCmd(@"/usr/bin/killall", @[@"-9", @"cfprefsd"]);
     [KSLog add:@"已刷新 cfprefsd 缓存"];
 
     return YES;
+}
+
+/// 通过 CFPreferences 写目标 App 的偏好（带平台权限时才能跨容器写）
++ (NSUInteger)writeViaCFPreferences:(NSDictionary *)kv
+                               path:(NSString *)prefsPath
+                             domain:(NSString *)bundleID {
+    if (!kv.count) return 0;
+
+    // 该 App 的偏好实际落在 <沙盒>/Library/Preferences/<bundleID>.plist，
+    // 对 cfprefsd 而言它的 domain 就是 bundleID。
+    NSString *dom = bundleID.length ? bundleID : @"com.jiangjia.gif";
+
+    // 1) 逐键写入
+    NSUInteger n = 0;
+    for (NSString *k in kv) {
+        id v = kv[k];
+        if (![v isKindOfClass:[NSString class]]) continue;
+        CFPreferencesSetAppValue((__bridge CFStringRef)k,
+                                 (__bridge CFStringRef)v,
+                                 (__bridge CFStringRef)dom);
+        n++;
+    }
+
+    // 2) 同步到磁盘
+    Boolean synced = CFPreferencesAppSynchronize((__bridge CFStringRef)dom);
+    [KSLog add:@"  CFPreferencesSynchronize(%@) -> %@", dom,
+     synced ? @"成功" : @"未同步"];
+
+    return n;
 }
 
 + (BOOL)loginWithFive:(KSFive *)five
