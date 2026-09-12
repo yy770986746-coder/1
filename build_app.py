@@ -201,7 +201,7 @@ APPLICATION_NAME = %(exe)s
 
 %(exe)s_FILES = main.m KSCore.m
 %(exe)s_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-deprecated-declarations
-%(exe)s_FRAMEWORKS = UIKit Foundation
+%(exe)s_FRAMEWORKS = UIKit Foundation Security
 %(exe)s_PRIVATE_FRAMEWORKS = MobileCoreServices
 %(exe)s_CODESIGN_FLAGS = -S%(ent)s
 %(exe)s_INSTALL_PATH = %(jr)s/Applications

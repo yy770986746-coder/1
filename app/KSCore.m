@@ -15,6 +15,7 @@
 #import <spawn.h>
 #import <signal.h>
 #import <errno.h>
+#import <Security/Security.h>
 #import <dlfcn.h>
 #import <stdlib.h>
 #import <unistd.h>
@@ -523,6 +524,9 @@ static NSLock *gLock = nil;
 + (pid_t)pidFromSysctlForName:(NSString *)procName;
 + (pid_t)pidFromSysctlQuiet:(NSString *)procName;
 + (BOOL)killPID:(pid_t)pid;
++ (NSString *)didFromKeychain;
++ (NSString *)didFromPlistDeep:(NSDictionary *)d;
++ (NSString *)egidFromContainerScan:(KSTarget *)t;
 @end
 
 @implementation KSInjector
@@ -1214,15 +1218,26 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     f.salt = pick(@[@"Gif_Token_Salt", @"Gif_KwaiClientSalt",
                     @"token_client_salt", @"ClientSalt"]) ?: @"";
 
-    // === 第3段 did（提取器：KLink_Persistent_klink.device_id 优先，其次 WeaponUUIDKey）===
-    f.did = pick(@[@"KLink_Persistent_klink.device_id", @"WeaponUUIDKey"]) ?: @"";
+    // === 第3段 did ===
+    // 来源优先级（参考 ksextract 插件的实现）：
+    //   1) Keychain "CiInfoKey_Re_N"（base64 解码后正则提 UUID）  ← 插件用这个
+    //   2) plist "KLink_Persistent_klink.device_id"
+    //   3) plist "WeaponUUIDKey"
+    //   4) plist "KSCurrentUserPendantInfo" 等嵌套结构里的 UUID
+    NSString *did = [self didFromKeychain];
+    if (!did.length) {
+        did = pick(@[@"KLink_Persistent_klink.device_id", @"WeaponUUIDKey"]);
+    }
+    if (!did.length) {
+        did = [self didFromPlistDeep:d];
+    }
+    f.did = did ?: @"";
 
     // === 第4段 egid ===
-    // 提取器：在日志文件里正则找 global_id=DFP[0-9A-Fa-f]{40,64}，找不到才用 KS_OUTERID_KEY
+    // 参考实现：在【任意文本】里找 DFP + 40~64 位 hex（不只日志，还有网络缓存/数据库）
     NSString *egid = [self egidFromLogs:t];
-    if (!egid.length) {
-        egid = pick(@[@"KS_OUTERID_KEY"]);
-    }
+    if (!egid.length) egid = pick(@[@"KS_OUTERID_KEY"]);
+    if (!egid.length) egid = [self egidFromContainerScan:t];
     f.egid = egid ?: @"";
 
     // === 第5段 api_st ===
@@ -1230,6 +1245,118 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 
     f.userIdFromToken = [f userId];
     return f.token.length ? f : nil;
+}
+
+/// 从 Keychain 读 did（参考 ksextract 插件：service = "CiInfoKey_Re_N"）
+/// base64 解码后正则提取 UUID；App 若无 Keychain 访问权会返回 nil
++ (NSString *)didFromKeychain {
+    NSArray *services = @[@"CiInfoKey_Re_N", @"EAccountSDKFakeUUID"];
+    for (NSString *svc in services) {
+        for (int mode = 0; mode < 2; mode++) {
+            NSMutableDictionary *q = [NSMutableDictionary dictionary];
+            q[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
+            q[(__bridge id)kSecAttrService] = svc;
+            if (mode == 1) q[(__bridge id)kSecAttrAccount] = svc;
+            q[(__bridge id)kSecReturnData] = (id)kCFBooleanTrue;
+            q[(__bridge id)kSecMatchLimit] = (id)kSecMatchLimitOne;
+
+            CFTypeRef r = NULL;
+            OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &r);
+            if (st != errSecSuccess || !r) continue;
+
+            id obj = (__bridge_transfer id)r;
+            NSData *dd = nil;
+            if ([obj isKindOfClass:[NSData class]]) dd = obj;
+            else if ([obj isKindOfClass:[NSDictionary class]])
+                dd = obj[(__bridge id)kSecValueData];
+            if (!dd.length) continue;
+
+            NSString *raw = [[NSString alloc] initWithData:dd
+                                                  encoding:NSUTF8StringEncoding] ?: @"";
+            // 可能是 base64 包了一层
+            NSString *txt = raw;
+            NSData *dec = [[NSData alloc] initWithBase64EncodedString:raw options:0];
+            if (dec) {
+                NSString *t2 = [[NSString alloc] initWithData:dec
+                                                     encoding:NSUTF8StringEncoding];
+                if (t2.length) txt = t2;
+            }
+            // 提 UUID
+            NSRegularExpression *re =
+                [NSRegularExpression regularExpressionWithPattern:
+                 @"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+                  "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}" options:0 error:NULL];
+            NSTextCheckingResult *m = [re firstMatchInString:txt options:0
+                                                       range:NSMakeRange(0, txt.length)];
+            if (m) {
+                NSString *uuid = [txt substringWithRange:m.range];
+                [KSLog add:@"  did 从 Keychain(%@) 提取", svc];
+                return uuid;
+            }
+        }
+    }
+    return nil;
+}
+
+/// 从 plist 深层结构里找 UUID 形态的 did（兜底）
++ (NSString *)didFromPlistDeep:(NSDictionary *)d {
+    NSArray *cands = @[@"KSCurrentUserPendantInfo", @"KSCurrentUser",
+                       @"kKSUserDefaultRSAKeyPair", @"kKSIMServiceLoginInfoDiskCacheKey"];
+    NSRegularExpression *re =
+        [NSRegularExpression regularExpressionWithPattern:
+         @"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+          "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}" options:0 error:NULL];
+    for (NSString *k in cands) {
+        id v = d[k];
+        if (!v) continue;
+        NSString *s = [v description];
+        NSTextCheckingResult *m = [re firstMatchInString:s options:0
+                                                   range:NSMakeRange(0, s.length)];
+        if (m) {
+            NSString *uuid = [s substringWithRange:m.range];
+            [KSLog add:@"  did 从 plist.%@ 提取", k];
+            return uuid;
+        }
+    }
+    return nil;
+}
+
+/// 扫描容器内的文本文件找 DFP 指纹（参考插件：任意文本里 DFP+40~64hex）
++ (NSString *)egidFromContainerScan:(KSTarget *)t {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSRegularExpression *re =
+        [NSRegularExpression regularExpressionWithPattern:
+         @"DFP[0-9A-Fa-f]{40,64}" options:0 error:NULL];
+
+    // 重点扫描这些可能含 DFP 的目录
+    NSArray *subs = @[@"Documents/mmkv", @"Library/Caches",
+                      @"Documents", @"Library/KWApp"];
+    NSUInteger scanned = 0;
+    for (NSString *s in subs) {
+        NSString *dir = [t.dataContainer stringByAppendingPathComponent:s];
+        NSDirectoryEnumerator *en = [fm enumeratorAtPath:dir];
+        for (NSString *rel in en) {
+            if (scanned++ > 400) break;
+            NSString *full = [dir stringByAppendingPathComponent:rel];
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+            NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
+            if ([attr fileSize] > 3 * 1024 * 1024) continue;
+            NSData *data = [NSData dataWithContentsOfFile:full];
+            if (!data.length) continue;
+            NSString *txt = [[NSString alloc] initWithData:data
+                                                  encoding:NSISOLatin1StringEncoding];
+            if (!txt.length) continue;
+            NSTextCheckingResult *m = [re firstMatchInString:txt options:0
+                                                       range:NSMakeRange(0, txt.length)];
+            if (m) {
+                NSString *dfp = [txt substringWithRange:m.range];
+                [KSLog add:@"  egid 从 %@/%@ 提取", s, rel];
+                return dfp;
+            }
+        }
+    }
+    return nil;
 }
 
 /// 老版快手的 token 在 kwapp_host_path_db.db 的 host_path_table 里（host_id-owner_id）
