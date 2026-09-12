@@ -525,6 +525,7 @@ static NSLock *gLock = nil;
 + (pid_t)pidFromSysctlQuiet:(NSString *)procName;
 + (BOOL)killPID:(pid_t)pid;
 + (NSString *)didFromKeychain;
++ (NSString *)didFromNetworkCache;
 + (NSDictionary *)loadPlistAt:(NSString *)path;
 + (NSString *)didFromPlistDeep:(NSDictionary *)d;
 + (NSString *)egidFromContainerScan:(KSTarget *)t;
@@ -1272,18 +1273,17 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
                     @"token_client_salt", @"ClientSalt"]) ?: @"";
 
     // === 第3段 did ===
-    // 来源优先级（参考 ksextract 插件的实现）：
-    //   1) Keychain "CiInfoKey_Re_N"（base64 解码后正则提 UUID）  ← 插件用这个
+    // 来源优先级（真机实测校准）：
+    //   1) 网络缓存里 "did=<UUID>" 的最新值  ← 实测最准（与 egid 同现，且随换号更新）
     //   2) plist "KLink_Persistent_klink.device_id"
     //   3) plist "WeaponUUIDKey"
-    //   4) plist "KSCurrentUserPendantInfo" 等嵌套结构里的 UUID
-    NSString *did = [self didFromKeychain];
+    //   4) Keychain "CiInfoKey_Re_N"（实测值可能不是 did，放最后）
+    NSString *did = [self didFromNetworkCache];
     if (!did.length) {
         did = pick(@[@"KLink_Persistent_klink.device_id", @"WeaponUUIDKey"]);
     }
-    if (!did.length) {
-        did = [self didFromPlistDeep:d];
-    }
+    if (!did.length) did = [self didFromPlistDeep:d];
+    if (!did.length) did = [self didFromKeychain];
     f.did = did ?: @"";
 
     // === 第4段 egid ===
@@ -1303,11 +1303,74 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     return f.token.length ? f : nil;
 }
 
+/// 从网络缓存/日志里找【当前活跃】的 did
+///
+/// ★ 真机实测教训：
+///   Keychain 的 CiInfoKey_Re_N 读出来的 UUID 与网络请求里的 did 不一致
+///   （实测 Keychain 给 D506B263-…，而请求里是 3E796C4D-…），
+///   说明那个 Keychain 项不是 did。
+///   可靠做法：从请求参数 "did=<UUID>" 里取【最靠后出现】的那个 ——
+///   缓存会累积历史值（换号/改机产生），偏移越靠后 = 越新 = 当前活跃。
++ (NSString *)didFromNetworkCache {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSRegularExpression *re =
+        [NSRegularExpression regularExpressionWithPattern:
+         @"\\bdid=([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+          "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})" options:0 error:NULL];
+
+    NSArray *subs = @[
+        @"Library/Caches/com.jiangjia.gif/KSURLCache",
+        @"Library/Caches/com.jiangjia.gif",
+        @"Library/vadar",
+        @"Library/Caches",
+    ];
+
+    NSString *best = nil;
+    NSUInteger bestOff = 0;
+    NSUInteger scanned = 0;
+
+    for (NSString *sub in subs) {
+        NSString *dir = [[self containerRoot] stringByAppendingPathComponent:sub];
+        NSDirectoryEnumerator *en = [fm enumeratorAtPath:dir];
+        for (NSString *rel in en) {
+            if (scanned++ > 300) break;
+            NSString *full = [dir stringByAppendingPathComponent:rel];
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+            NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
+            if ([attr fileSize] > 8 * 1024 * 1024) continue;
+
+            NSData *data = [NSData dataWithContentsOfFile:full];
+            if (!data.length) continue;
+            NSString *txt = [[NSString alloc] initWithData:data
+                                                  encoding:NSISOLatin1StringEncoding];
+            if (!txt.length) continue;
+
+            NSArray *ms = [re matchesInString:txt options:0
+                                        range:NSMakeRange(0, txt.length)];
+            // 取该文件里【最后一个】did=（越靠后越新）
+            NSTextCheckingResult *last = ms.lastObject;
+            if (!last || last.numberOfRanges < 2) continue;
+            NSUInteger off = last.range.location;
+            NSString *v = [txt substringWithRange:[last rangeAtIndex:1]];
+            if (off >= bestOff) {
+                bestOff = off;
+                best = v;
+            }
+        }
+        if (best) break;   // 找到就停（KSURLCache 最权威）
+    }
+
+    if (best) {
+        [KSLog add:@"  did 从网络缓存取最新值 → %@", best];
+    }
+    return best;
+}
+
 /// 从 Keychain 读 did（参考 ksextract 插件：service = "CiInfoKey_Re_N"）
 /// base64 解码后正则提取 UUID
-/// ★ 关键：快手 Keychain group 是 "NR2KD6K4TL.com.jiangjia.gif"，
-///   App 的 entitlements 必须声明该 group（已在 build_app.py 的 ENTITLEMENTS 里加上），
-///   否则 SecItemCopyMatching 一律返回 errSecMissingEntitlement。
+/// ★ 注意：实测真机上这个 Keychain 项的值与请求里的 did 不一致，
+///   所以只作为【次要】来源，主来源是 didFromNetworkCache。
 + (NSString *)didFromKeychain {
     // 先试快手自己的 access group，再试默认组
     NSArray *groups = @[@"NR2KD6K4TL.com.jiangjia.gif",
@@ -1403,38 +1466,51 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 }
 
 /// 扫描容器文本文件找 egid
-/// @param knownDid 已知的 did（UUID），用于锁定同现的 DFP；可为空
+/// @param knownDid 已知的 did（UUID），用于锁定同现的 egid；可为空
+///
+/// ★ 真机 Cache.db-wal 实测（唯一正确的判据）：
+///   请求 URL 里三个字段并存，值各不相同，只有 egid 才是我们要的第4段：
+///     ...&did=BEA9D9B2-121F-27F4-CB7B-6FD40BBD4AF6&did_tag=0
+///        &egid=DFP4563194B86C20E86E14090E2F5182F1FA0231143E876123B9B45415DE1BE7
+///        &global_id=DFP2F2703D7DBEE96E909DAFECF3CF17BD7CC34F59CB61A05AB8D3709366AED1...
+///   注意 global_id 与 egid 不同，绝不能拿 global_id 当 egid。
+///   所以只认 "egid=DFP..." 这种键值对形式。
 + (NSString *)egidScan:(NSString *)knownDid {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSRegularExpression *dfpRe =
+
+    // 精确匹配 egid=DFP...（只认 egid 这个键名）
+    NSRegularExpression *egidRe =
+        [NSRegularExpression regularExpressionWithPattern:
+         @"\\begid=(DFP[0-9A-Fa-f]{40,64})" options:0 error:NULL];
+    // 宽松匹配：任意位置的 DFP（仅作最后兜底）
+    NSRegularExpression *anyDfpRe =
         [NSRegularExpression regularExpressionWithPattern:
          @"DFP[0-9A-Fa-f]{40,64}" options:0 error:NULL];
 
-    // 优先扫描网络缓存（实测 DFP 就在这里）
+    // 按优先级扫描（网络缓存里最可能有 egid= 键值对）
     NSArray *subs = @[
-        @"Library/Caches/com.jiangjia.gif",
         @"Library/Caches/com.jiangjia.gif/KSURLCache",
+        @"Library/Caches/com.jiangjia.gif",
+        @"Library/vadar",
         @"Library/Caches/ObiwanLogs",
         @"Documents/mmkv",
         @"Library/Caches",
-        @"Documents/com.hawkeye.data",
     ];
 
-    NSString *fallback = nil;     // 没锁定 did 时，用出现次数最多的
+    NSString *bestAny = nil;
     NSMutableDictionary *counter = [NSMutableDictionary dictionary];
     NSUInteger scanned = 0;
 
     for (NSString *sub in subs) {
-        NSString *dir = [sub hasPrefix:@"/"] ? sub
-                       : [[self containerRoot] stringByAppendingPathComponent:sub];
+        NSString *dir = [[self containerRoot] stringByAppendingPathComponent:sub];
         NSDirectoryEnumerator *en = [fm enumeratorAtPath:dir];
         for (NSString *rel in en) {
-            if (scanned++ > 500) break;
+            if (scanned++ > 400) break;
             NSString *full = [dir stringByAppendingPathComponent:rel];
             BOOL isDir = NO;
             if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
             NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
-            if ([attr fileSize] > 4 * 1024 * 1024) continue;
+            if ([attr fileSize] > 8 * 1024 * 1024) continue;
 
             NSData *data = [NSData dataWithContentsOfFile:full];
             if (!data.length) continue;
@@ -1442,34 +1518,31 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
                                                   encoding:NSISOLatin1StringEncoding];
             if (!txt.length) continue;
 
-            // ① 若已知 did，找与它同现的 DFP
-            if (knownDid.length && [txt containsString:knownDid]) {
-                NSRange dr = [txt rangeOfString:knownDid];
-                // 在 did 前后各 400 字符窗口内找 DFP
-                NSUInteger lo = dr.location > 400 ? dr.location - 400 : 0;
-                NSUInteger hi = MIN(txt.length, dr.location + dr.length + 400);
-                NSRange win = NSMakeRange(lo, hi - lo);
-                NSTextCheckingResult *m = [dfpRe firstMatchInString:txt options:0 range:win];
-                if (m) {
-                    NSString *dfp = [txt substringWithRange:m.range];
-                    [KSLog add:@"  egid 与 did 同现于 %@/%@ → %@",
-                     [sub lastPathComponent], rel, dfp];
-                    return dfp;
-                }
+            // ① 首选：egid=DFP... 键值对
+            NSArray *ms = [egidRe matchesInString:txt options:0
+                                            range:NSMakeRange(0, txt.length)];
+            for (NSTextCheckingResult *m in ms) {
+                if (m.numberOfRanges < 2) continue;
+                NSString *v = [txt substringWithRange:[m rangeAtIndex:1]];
+                counter[v] = @([counter[v] integerValue] + 1);
+            }
+            if (ms.count) {
+                [KSLog add:@"  %@/%@ 里找到 %lu 个 egid= 键值对",
+                 [sub lastPathComponent], rel, (unsigned long)ms.count];
             }
 
-            // ② 兜底：统计出现次数
-            NSArray *ms = [dfpRe matchesInString:txt options:0
-                                           range:NSMakeRange(0, txt.length)];
-            for (NSTextCheckingResult *m in ms) {
-                NSString *dfp = [txt substringWithRange:m.range];
-                counter[dfp] = @([counter[dfp] integerValue] + 1);
-                if (!fallback) fallback = dfp;
+            // ② 兜底记录：任意 DFP（取出现最多的）
+            if (!bestAny) {
+                if (knownDid.length && [txt containsString:knownDid]) {
+                    NSTextCheckingResult *dm = [anyDfpRe firstMatchInString:txt
+                        options:0 range:NSMakeRange(0, txt.length)];
+                    if (dm) bestAny = [txt substringWithRange:dm.range];
+                }
             }
         }
     }
 
-    // 取出现次数最多的
+    // 取「egid=」出现次数最多的那个
     NSString *best = nil;
     NSInteger bestN = 0;
     for (NSString *k in counter) {
@@ -1477,8 +1550,12 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         if (n > bestN) { bestN = n; best = k; }
     }
     if (best) {
-        [KSLog add:@"  egid 取出现最多的 DFP（%ld 次）→ %@", (long)bestN, best];
+        [KSLog add:@"  egid 取自 egid= 键值对（%ld 次）→ %@", (long)bestN, best];
         return best;
+    }
+    if (bestAny) {
+        [KSLog add:@"  egid 兜底（did 同现的 DFP）→ %@", bestAny];
+        return bestAny;
     }
     return nil;
 }
@@ -1522,9 +1599,12 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
                          stringByAppendingPathComponent:@"Documents/com.hawkeye.data"];
     if (![fm fileExistsAtPath:logRoot]) return nil;
 
+    // ★ 必须用 egid= 而不是 global_id= —— 真机实测两者值不同：
+    //     egid=DFP4563194B86C2...      ← 这才是第4段
+    //     global_id=DFP2F2703D7DBEE... ← 另一个字段，不能混用
     NSRegularExpression *re =
         [NSRegularExpression regularExpressionWithPattern:
-         @"global_id=(DFP[0-9A-Fa-f]{40,64})" options:0 error:NULL];
+         @"\\begid=(DFP[0-9A-Fa-f]{40,64})" options:0 error:NULL];
 
     NSDirectoryEnumerator *en = [fm enumeratorAtPath:logRoot];
     int scanned = 0;
