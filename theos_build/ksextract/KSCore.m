@@ -631,31 +631,47 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
         if (k.length && v.length) { plist[k] = v; n++; }
     };
 
-    // === 主键：严格对齐 token_v1.0.4.apk 的 KuaishouInjector.buildXml() ===
-    // 原工具（Android，实测可登录）只写这三个键：
-    //   gifshow_token     = 第1段（完整 "32位hex-用户ID"）
-    //   gifshow_userid    = 第1段尾部的数字 uid
-    //   token_client_salt = 第2段（32位hex）
-    // 这三行是登录成败的关键，其余键都只是保险。
-    put(@"gifshow_token",      five.token);
-    put(@"gifshow_userid",     [five userId]);
+    // === 键名表：从快手 iOS 主二进制（com_kwai_gif，14.8.10）实测提取 ===
+    //   实测存在：Gif_Token / Gif_Token_Salt / Gif_KwaiClientSalt /
+    //            Gif_ServiceToken / Gif_PassToken / Gif_LastLoginType /
+    //            Gif_ID / Gif_Kwai_ID / Gif_Name / Gif_HeadUrl / Gif_Sex /
+    //            Gif_Email / Gif_Kwai_New_User / Gif_FansNumber /
+    //            Gif_ProfileUserType / token_client_salt
+    //   实测不存在：gifshow_token / gifshow_userid（Android 专用，iOS 不认）
+    //              Gif_User（iOS 用的是 Gif_ID / Gif_Kwai_ID）
+    __block NSUInteger n = 0;
+    void (^put)(NSString *, NSString *) = ^(NSString *k, NSString *v) {
+        if (k.length && v.length) { plist[k] = v; n++; }
+    };
+
+    NSString *uid = [five userId];
+
+    // === 核心登录键（iOS 命名，二进制实测存在）===
+    put(@"Gif_Token",          five.token);   // 第1段：完整 "32位hex-用户ID"
+    put(@"Gif_Token_Salt",     five.salt);    // 第2段：32位hex
+    put(@"Gif_KwaiClientSalt", five.salt);    // 同一份 salt，客户端另一处读法
+
+    // uid：iOS 用 Gif_ID / Gif_Kwai_ID（不是 Gif_User —— 那个键不存在）
+    put(@"Gif_ID",             uid);
+    put(@"Gif_Kwai_ID",        uid);
+
+    // 登录态标记
+    put(@"Gif_LastLoginType",  @"1");         // 1 = 正常登录
+    put(@"Gif_Kwai_New_User",  @"0");         // 0 = 老用户
+
+    // === 服务端票据（第4/5段）===
+    // 第5段 base64 解出来是 protobuf：字段1 = "kuaishou.api.st"
+    //   → 名字里带 st(service token)，所以它才是 Gif_ServiceToken
+    // 第4段 64 位 hex（用户称之为 egid/api_st）→ Gif_PassToken
+    put(@"Gif_ServiceToken",   five.passToken.length ? five.passToken : five.apiSt);
+    put(@"Gif_PassToken",      five.apiSt.length ? five.apiSt : five.passToken);
+
+    // === 兜底键名（不同版本/组件的备用读法）===
     put(@"token_client_salt",  five.salt);
-
-    // === iOS 端的等价键（同一份数据，iOS 快手可能读 Gif_* 命名）===
-    put(@"Gif_Token",          five.token);
-    put(@"Gif_User",           [five userId]);
-    put(@"Gif_Token_Salt",     five.salt);
-    put(@"Gif_KwaiClientSalt", five.salt);
-    put(@"Gif_LastLoginType",  @"1");
-
-    // 其余段位的备用键（原工具没用到，写了不冲突）
     put(@"ClientSalt",         five.salt);
-    put(@"uid",                [five userId]);
-    put(@"user_id",            [five userId]);
-    put(@"userId",             [five userId]);
-    put(@"Gif_ServiceToken",   five.apiSt.length ? five.apiSt : five.passToken);
-    put(@"Gif_PassToken",      five.passToken.length ? five.passToken : five.apiSt);
-    put(@"Gif_H5Token",        five.hToken);
+    put(@"uid",                uid);
+    put(@"user_id",            uid);
+    put(@"userId",             uid);
 
     if (n == 0) {
         [KSLog add:@"✗ 没有可写入的键"];
