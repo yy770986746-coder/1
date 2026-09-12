@@ -791,7 +791,13 @@ def main():
     ap.add_argument("--theos", action="store_true", help="只生成 Theos 工程")
     ap.add_argument("--xcode", action="store_true", help="只生成 Xcode 工程")
     ap.add_argument("--pack", metavar="APP_DIR", help="把编译好的 .app 打成 deb")
+    ap.add_argument("--icons", metavar="APP_DIR", help="只给已编译的 .app 生成图标")
     args = ap.parse_args()
+
+    if args.icons:
+        ok = _write_icons(args.icons)
+        print("[图标] %s" % ("已生成" if ok else "跳过（没装 Pillow）"))
+        return 0
 
     if args.pack:
         pack_deb(args.pack)
