@@ -511,6 +511,7 @@ static NSLock *gLock = nil;
 + (NSUInteger)writeViaCFPreferences:(NSDictionary *)kv
                                path:(NSString *)prefsPath
                              domain:(NSString *)bundleID;
++ (void)flushDaemons;
 @end
 
 @implementation KSInjector
@@ -669,38 +670,54 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     }
 
     // ---- 落盘 ----
-    // ★ iOS 上直接改 plist 文件会被 cfprefsd 覆盖（它内存里有缓存，
-    //   重启后按缓存重建文件，把我们的写入冲掉）。
-    //   正确路径：通过 CFPreferences 接口写，让 cfprefsd 自己落盘。
-    NSUInteger cfOK = [self writeViaCFPreferences:plist
-                                             path:t.prefsPath
-                                           domain:t.bundleID];
-    [KSLog add:@"CFPreferences 写入 %lu 个键", (unsigned long)cfOK];
+    // ★ 核心顺序（否则写入会被 cfprefsd 覆盖）：
+    //   1) 先杀 cfprefsd —— 清掉它内存里的旧 plist 缓存
+    //   2) 立刻写文件 —— 此时没有守护进程会回写
+    //   3) 再杀一次 cfprefsd —— 确保刚重启的实例重新从磁盘加载我们的数据
+    //   4) 结束快手 —— 它启动时才会读到新值
+    // 实测教训：只写文件不杀 cfprefsd，快手下一次启动时旧值会被刷回来。
 
-    // 文件写入作为兜底（cfprefsd 不可用 / 权限受限时仍可能生效）
+    // [1] 清缓存
+    [self flushDaemons];
+    usleep(300 * 1000);
+
+    // [2] 写文件（此时 cfprefsd 不在，不会被覆盖）
     NSString *tmp = [t.prefsPath stringByAppendingString:@".ks_tmp"];
     BOOL ok = [plist writeToFile:tmp atomically:YES];
     if (!ok) {
-        [KSLog add:@"⚠ plist 文件写入失败（沙盒权限不足？），仅依赖 CFPreferences"];
-    } else {
-        [fm removeItemAtPath:t.prefsPath error:NULL];
-        NSError *mvErr = nil;
-        [fm moveItemAtPath:tmp toPath:t.prefsPath error:&mvErr];
-        if (mvErr) {
-            [KSLog add:@"⚠ 替换 plist 文件失败: %@", mvErr.localizedDescription];
-        } else {
-            [KSLog add:@"✓ plist 文件已写入"];
-        }
+        [KSLog add:@"✗ plist 文件写入失败（沙盒权限不足？）"];
+        return NO;
     }
+    [fm removeItemAtPath:t.prefsPath error:NULL];
+    NSError *mvErr = nil;
+    [fm moveItemAtPath:tmp toPath:t.prefsPath error:&mvErr];
+    if (mvErr) {
+        [KSLog add:@"✗ 替换 plist 失败: %@", mvErr.localizedDescription];
+        return NO;
+    }
+    [KSLog add:@"✓ plist 已写入 %lu 个键", (unsigned long)n];
 
-    [KSLog add:@"✓ 已写入 %lu 个登录键", (unsigned long)n];
-    [KSLog add:@"  Gif_Token = %@", five.token];
-
+    // 写完后立即修正属主/权限（cfprefsd 重启前完成）
     [self fixOwnership:t.prefsPath target:t];
 
-    // 刷新 cfprefsd 缓存（让它把内存里的新值同步到磁盘）
-    runCmd(@"/usr/bin/killall", @[@"-9", @"cfprefsd"]);
-    [KSLog add:@"已刷新 cfprefsd 缓存"];
+    // [3] 再杀一次，强迫重新加载
+    [self flushDaemons];
+    usleep(300 * 1000);
+    [KSLog add:@"✓ cfprefsd/containermanagerd 缓存已刷新"];
+
+    // [4] 结束快手（确保它启动时读的是新数据）
+    [self killKuaishou];
+
+    // 校验：把刚写的文件读回来，确认关键键真的在
+    NSDictionary *verify = [NSDictionary dictionaryWithContentsOfFile:t.prefsPath];
+    NSString *vt = verify[@"Gif_Token"];
+    if (vt.length) {
+        [KSLog add:@"✓ 校验通过: Gif_Token=%@", vt];
+    } else {
+        [KSLog add:@"⚠ 校验失败: 读回的 plist 里没有 Gif_Token（可能被覆盖）"];
+    }
+    [KSLog add:@"  Gif_ID=%@  Salt=%@",
+     verify[@"Gif_ID"] ?: @"(无)", verify[@"Gif_Token_Salt"] ?: @"(无)"];
 
     return YES;
 }
@@ -732,6 +749,14 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
      synced ? @"成功" : @"未同步"];
 
     return n;
+}
+
+/// 终止容器管理/偏好守护进程，确保我们写的文件不会被内存缓存覆盖
++ (void)flushDaemons {
+    NSArray *daemons = @[@"cfprefsd", @"containermanagerd"];
+    for (NSString *d in daemons) {
+        runCmd(@"/usr/bin/killall", @[@"-9", d]);
+    }
 }
 
 + (BOOL)loginWithFive:(KSFive *)five
