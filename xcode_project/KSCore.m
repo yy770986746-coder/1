@@ -684,11 +684,14 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     for (int i = 0; i < count; i++) {
         pid_t p = buf[i].kp_proc.p_pid;
         if (p <= 0) continue;
-        // 优先用 p_comm（内核里的进程名，就是可执行文件名）
-        NSString *comm = [NSString stringWithUTF8String:buf[i].kp_proc.p_comm];
-        if (comm.length && [comm isEqualToString:procName]) {
+        // 用 p_comm 对比进程名（与 runningProcessName 相同写法，保证可编译）
+        const char *cname = buf[i].kp_proc.p_comm;
+        if (cname == NULL) continue;
+        NSString *comm = [NSString stringWithUTF8String:cname];
+        if (comm == nil) continue;
+        if ([comm isEqualToString:procName]) {
             found = p;
-            [KSLog add:@"  sysctl 命中 %@ → PID=%d", comm, (int)p);
+            [KSLog add:@"  sysctl 命中 %@ → PID=%d", comm, (int)p];
             break;
         }
     }
