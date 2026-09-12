@@ -512,6 +512,7 @@ static NSLock *gLock = nil;
                                path:(NSString *)prefsPath
                              domain:(NSString *)bundleID;
 + (void)flushDaemons;
++ (BOOL)writeDID:(NSString *)did target:(KSTarget *)t;
 @end
 
 @implementation KSInjector
@@ -576,6 +577,71 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     [fm setAttributes:@{NSFilePosixPermissions: @(0755)} ofItemAtPath:dir error:NULL];
 
     return YES;
+}
+
+/// 写入 did（设备标识）到快手容器
+/// 实测路径：<容器>/Library/Application Support/com.kuaishou.did
+/// 内容是 36 字节纯文本 UUID，如 4C96E59A-0F12-47E8-B56B-FFB036C694CB
+/// 必须与 token 配套：token 是源设备签发的，did 也必须是源设备的，
+/// 否则服务器判定设备不匹配 → 登录态失效 / 功能闪退。
++ (BOOL)writeDID:(NSString *)did target:(KSTarget *)t {
+    if (!did.length) {
+        [KSLog add:@"⚠ did 为空，跳过"];
+        return NO;
+    }
+    // 必须是标准 UUID 格式
+    NSRegularExpression *uuidRe =
+        [NSRegularExpression regularExpressionWithPattern:
+         @"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+          "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$" options:0 error:NULL];
+    if (![uuidRe numberOfMatchesInString:did options:0
+                                   range:NSMakeRange(0, did.length)]) {
+        [KSLog add:@"⚠ did 格式不是标准 UUID，跳过: %@", did];
+        return NO;
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *base = [t.dataContainer stringByAppendingPathComponent:
+                      @"Library/Application Support"];
+    if (![fm fileExistsAtPath:base]) {
+        [KSLog add:@"⚠ 目录不存在: %@", base];
+        return NO;
+    }
+    NSString *didPath = [base stringByAppendingPathComponent:@"com.kuaishou.did"];
+
+    // 读旧值做记录
+    NSString *old = [NSString stringWithContentsOfFile:didPath
+                                             encoding:NSUTF8StringEncoding
+                                                error:NULL];
+    [KSLog add:@"did 旧值: %@", old.length ? old : @"(无)"];
+
+    // 备份一次（只在首次备份，避免覆盖掉最初的原始值）
+    NSString *bak = [didPath stringByAppendingString:@".ksbak"];
+    if (![fm fileExistsAtPath:bak] && old.length) {
+        [fm copyItemAtPath:didPath toPath:bak error:NULL];
+    }
+
+    // 写入（不带换行，和设备原格式一致）
+    NSError *we = nil;
+    BOOL ok = [did writeToFile:didPath atomically:YES
+                      encoding:NSUTF8StringEncoding error:&we];
+    if (!ok) {
+        [KSLog add:@"✗ did 写入失败: %@", we.localizedDescription];
+        return NO;
+    }
+    [fm setAttributes:@{NSFilePosixPermissions: @(0644)}
+         ofItemAtPath:didPath error:NULL];
+    [self fixOwnership:didPath target:t];
+
+    NSString *now = [NSString stringWithContentsOfFile:didPath
+                                             encoding:NSUTF8StringEncoding
+                                                error:NULL];
+    if ([now isEqualToString:did]) {
+        [KSLog add:@"✓ did 已写入: %@", now];
+        return YES;
+    }
+    [KSLog add:@"✗ did 校验失败，读回: %@", now ?: @"(nil)"];
+    return NO;
 }
 
 + (BOOL)writeOnly:(KSFive *)five target:(KSTarget *)t {
@@ -837,6 +903,19 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
         return NO;
     }
     step(@"  ✓ 写入成功", YES);
+
+    // did 必须和 token 配套：token 是源设备签发的，did 也必须是源设备的
+    step(@"[5.5/6] 同步设备标识 did...", YES);
+    NSString *did = five.did;
+    if (did.length) {
+        if ([self writeDID:did target:t]) {
+            step([NSString stringWithFormat:@"  ✓ did = %@", did], YES);
+        } else {
+            step(@"  ⚠ did 写入失败（登录可能仍生效，但功能可能受限）", NO);
+        }
+    } else {
+        step(@"  ⚠ 参数里没有 did（第3段），跳过", NO);
+    }
 
     step(@"[6/6] 拉起快手...", YES);
     [KSTarget launch:t.bundleID];
