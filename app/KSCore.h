@@ -43,6 +43,9 @@
 @property (nonatomic, copy) NSString *apiSt;    // api_st（64位hex）
 @property (nonatomic, copy) NSString *hToken;
 @property (nonatomic, copy) NSString *passToken; // serviceToken（base64 protobuf）
+/// 用户资料（可选，缺失时用安全默认值兜底，避免快手 UI 拿到 nil 崩溃）
+@property (nonatomic, copy) NSString *nickName;
+@property (nonatomic, copy) NSString *headUrl;
 
 /// 从任意文本解析（五参行 / JSON / 键值对 / 中文破折号）
 + (instancetype)fromText:(NSString *)text;

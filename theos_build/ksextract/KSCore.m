@@ -631,8 +631,10 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     //   实测不存在：gifshow_token / gifshow_userid（Android 专用，iOS 不认）
     //              Gif_User（iOS 用的是 Gif_ID / Gif_Kwai_ID）
     __block NSUInteger n = 0;
+    // 注意：v 允许是空串 —— 资料类键写成空串是刻意的，
+    // 用来避免快手 UI 读到 nil 时崩在 layoutSublayers。
     void (^put)(NSString *, NSString *) = ^(NSString *k, NSString *v) {
-        if (k.length && v.length) { plist[k] = v; n++; }
+        if (k.length && v != nil) { plist[k] = v; n++; }
     };
 
     NSString *uid = [five userId];
@@ -649,6 +651,24 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     // 登录态标记
     put(@"Gif_LastLoginType",  @"1");         // 1 = 正常登录
     put(@"Gif_Kwai_New_User",  @"0");         // 0 = 老用户
+
+    // ★★ 用户资料键：必须补上，否则快手读到"已登录"后渲染资料页时
+    //    拿到 nil 会在主线程 layoutSublayers 抛 NSException 直接 SIGTRAP 闪退。
+    //    这些键在 iOS 主二进制里都存在，只是我们之前没写。
+    put(@"Gif_Name",           five.nickName.length ? five.nickName : @"快手用户");
+    put(@"Gif_HeadUrl",        five.headUrl.length ? five.headUrl : @"");
+    put(@"Gif_BigHeadUrls",    five.headUrl.length ? five.headUrl : @"");
+    put(@"Gif_defaultHead",    @"");          // 空串而非 nil，避免 UI 拿到 nil
+    put(@"Gif_Sex",            @"0");         // 0 = 未知，避免性别枚举越界
+    put(@"Gif_Email",          @"");
+    put(@"Gif_FansNumber",     @"0");
+    put(@"Gif_ProfileUserType",@"0");
+    put(@"Gif_Background",     @"");          // 个人页背景，同样不能是 nil
+    put(@"Gif_pendantType",    @"0");         // 挂件类型，枚举必须有值
+    put(@"Gif_pendantUrls",    @"");
+    put(@"Gif_Contacts_Uploaded", @"0");
+    put(@"Gif_User_Text",      @"");
+    put(@"Gif_H",              @"");
 
     // === 服务端票据（第4/5段）===
     // 第5段 base64 解出来是 protobuf：字段1 = "kuaishou.api.st"
