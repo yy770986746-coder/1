@@ -71,8 +71,6 @@ static NSLock *gLock = nil;
 #pragma mark - ========== 五参 ==========
 
 @interface KSFive ()
-+ (KSFive *)fiveFromParts:(NSArray<NSString *> *)parts;
-+ (BOOL)isHex:(NSString *)s;
 @end
 
 @implementation KSFive
@@ -136,15 +134,49 @@ static NSLock *gLock = nil;
         }
         if (parts.count < 2) continue;
 
-        // ★ 按格式特征识别每一段，不依赖固定顺序。
-        //   实测真机五参：
-        //     [0] 7e956da4...c11c4-5753397025  32位hex + "-" + 数字  => uid
-        //     [1] 1e257de8...a59ba5            纯 32 位 hex           => token
-        //     [2] 4C96E59A-0F12-47E8-...       UUID 三段             => salt
-        //     [3] DFP95CF5...(64位hex)         纯 64 位 hex           => api_st
-        //     [4] Cg9rdWFpc2hvdS5hcGkuc3Q...   base64(protobuf)       => serviceToken
-        //   老版本顺序可能是 token/salt/... 所以要兼容两种排布。
-        return [self fiveFromParts:parts];
+        // ★ 严格照搬 token_v1.0.4.apk 中 KuaishouInjector.parseInput() 的逻辑：
+        //     token = parts[0]（完整保留，形如 "32位hex-用户数字ID"）
+        //     uid   = parts[0] 里最后一个 '-' 之后的部分，必须全是数字
+        //     salt  = parts[1]，必须匹配 [a-fA-F0-9]{32}
+        //   第 3/4/5 段在原工具里没有被使用（但保留下来便于写入备用键）。
+        KSFive *f = [KSFive new];
+        NSString *tokenField = parts[0];
+        NSString *saltField  = parts[1];
+
+        NSRange lastDash = [tokenField rangeOfString:@"-"
+                                             options:NSBackwardsSearch];
+        if (lastDash.location == NSNotFound) {
+            [KSLog add:@"⚠ 第1段没有 '-'，无法取 uid，按原样处理"];
+        }
+        NSString *uid = tokenField;
+        if (lastDash.location != NSNotFound &&
+            lastDash.location + 1 < tokenField.length) {
+            uid = [tokenField substringFromIndex:lastDash.location + 1];
+        }
+
+        // 校验（与原工具一致：uid 必须纯数字，salt 必须 32 位 hex）
+        NSRegularExpression *numRe =
+            [NSRegularExpression regularExpressionWithPattern:@"^\\d+$"
+                                                     options:0 error:NULL];
+        NSRegularExpression *hex32Re =
+            [NSRegularExpression regularExpressionWithPattern:@"^[a-fA-F0-9]{32}$"
+                                                     options:0 error:NULL];
+        BOOL uidOK = [numRe numberOfMatchesInString:uid options:0
+                                              range:NSMakeRange(0, uid.length)] > 0;
+        BOOL saltOK = [hex32Re numberOfMatchesInString:saltField options:0
+                                                 range:NSMakeRange(0, saltField.length)] > 0;
+        [KSLog add:@"解析: token=%d字符 uid=%@(%@) salt=%@(%@)",
+         (int)tokenField.length, uid, uidOK ? @"合法" : @"⚠非纯数字",
+         saltField, saltOK ? @"合法" : @"⚠非32位hex"];
+
+        f.token = tokenField;      // 第1段：完整 "hex-uid"
+        f.salt  = saltField;       // 第2段：32位hex
+        f.did   = uid;             // 第1段尾部的数字 uid
+        // 其余段位尽量保留，供备用键写入
+        if (parts.count > 2) f.egid  = parts[2];
+        if (parts.count > 3) f.apiSt = parts[3];
+        if (parts.count > 4) f.passToken = parts[4];
+        return f;
     }
 
     // ---- 键值对兜底 ----
@@ -177,72 +209,6 @@ static NSLock *gLock = nil;
     return nil;
 }
 
-/// 按格式特征把若干段识别成五参（兼容顺序差异）
-+ (KSFive *)fiveFromParts:(NSArray<NSString *> *)parts {
-    KSFive *f = [KSFive new];
-    NSMutableArray<NSString *> *rest = [NSMutableArray array];
-
-    // 1) 先挑出 uid：32位hex + "-" + 数字，就是 validToken 认的那种格式
-    NSRegularExpression *uidRe =
-        [NSRegularExpression regularExpressionWithPattern:
-         @"^[0-9a-fA-F]{32}-\\d+$" options:0 error:NULL];
-    // 2) salt：UUID 格式
-    NSRegularExpression *uuidRe =
-        [NSRegularExpression regularExpressionWithPattern:
-         @"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
-                                                 options:0 error:NULL];
-
-    NSMutableArray<NSString *> *left = [NSMutableArray array];
-    for (NSString *p in parts) {
-        NSRange r = NSMakeRange(0, p.length);
-        if (!f.did && [uidRe numberOfMatchesInString:p options:0 range:r]) {
-            f.did = p;              // uid 存 did 字段（历史命名）
-            continue;
-        }
-        if (!f.salt && [uuidRe numberOfMatchesInString:p options:0 range:r]) {
-            f.salt = p;
-            continue;
-        }
-        [left addObject:p];
-    }
-
-    // 3) 剩下的里按格式分流：
-    //    纯 hex 且长度 != 32  -> api_st（实测 64 位，但不写死长度更稳）
-    //    纯 hex 且长度 == 32  -> token
-    //    含 - _ 等 base64 字符 -> serviceToken（protobuf）
-    for (NSString *p in left) {
-        BOOL hex = [self isHex:p];
-        if (hex && p.length == 32 && !f.token) {
-            f.token = p;
-            continue;
-        }
-        if (hex && p.length > 32 && !f.apiSt) {
-            f.apiSt = p;            // ← 这一段要进 Gif_ServiceToken
-            continue;
-        }
-        [rest addObject:p];
-    }
-
-    // 4) 剩余的按顺序补空位（serviceToken / passToken 等）
-    for (NSString *p in rest) {
-        if (!f.passToken)      f.passToken = p;
-        else if (!f.hToken)    f.hToken = p;
-        else if (!f.egid)      f.egid = p;
-    }
-
-    return (f.token.length || f.did.length) ? f : nil;
-}
-
-+ (BOOL)isHex:(NSString *)s {
-    static NSCharacterSet *hex = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        hex = [NSCharacterSet characterSetWithCharactersInString:
-               @"0123456789abcdefABCDEF"];
-    });
-    return [s rangeOfCharacterFromSet:[hex invertedSet]].location == NSNotFound;
-}
-
 - (BOOL)validToken {
     if (!self.token.length) return NO;
     NSRegularExpression *re =
@@ -263,12 +229,20 @@ static NSLock *gLock = nil;
 }
 
 - (NSString *)userId {
-    // uid 真身：优先 did（新解析器把 uid 放在这里），
-    // 兼容老格式——token 写成 "32位hex-数字" 时从尾部取。
+    // 解析阶段已经把 uid 放进 did（纯数字）。直接用它最稳。
+    NSRegularExpression *numRe =
+        [NSRegularExpression regularExpressionWithPattern:@"^\\d+$"
+                                                 options:0 error:NULL];
+    if (self.did.length &&
+        [numRe numberOfMatchesInString:self.did options:0
+                                 range:NSMakeRange(0, self.did.length)]) {
+        return self.did;
+    }
+    // 回退：token 写成 "32位hex-数字" 时，从尾部 '-' 后取
     for (NSString *cand in @[self.did ?: @"", self.token ?: @""]) {
         if (!cand.length) continue;
-        if ([cand rangeOfString:@"-"].location == NSNotFound) continue;
         NSRange d = [cand rangeOfString:@"-" options:NSBackwardsSearch];
+        if (d.location == NSNotFound) continue;
         NSString *tail = [cand substringFromIndex:d.location + 1];
         if (tail.length) return tail;
     }
@@ -657,45 +631,31 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
         if (k.length && v.length) { plist[k] = v; n++; }
     };
 
-    // === iOS 原生键（主线，实测存在）===
-    // 字段语义按用户实际五参的「格式特征」匹配（名字可能各家叫法不同，格式不会骗人）：
-    //   32位hex-数字 (43)  -> uid          -> Gif_User
-    //   32位纯hex     (32)  -> token        -> Gif_Token
-    //   标准UUID      (36)  -> salt         -> Gif_Token_Salt / Gif_KwaiClientSalt
-    //   64位纯hex     (64)  -> 长token/egid -> Gif_ServiceToken
-    //   base64 protobuf     -> serviceToken -> Gif_PassToken
+    // === 主键：严格对齐 token_v1.0.4.apk 的 KuaishouInjector.buildXml() ===
+    // 原工具（Android，实测可登录）只写这三个键：
+    //   gifshow_token     = 第1段（完整 "32位hex-用户ID"）
+    //   gifshow_userid    = 第1段尾部的数字 uid
+    //   token_client_salt = 第2段（32位hex）
+    // 这三行是登录成败的关键，其余键都只是保险。
+    put(@"gifshow_token",      five.token);
+    put(@"gifshow_userid",     [five userId]);
+    put(@"token_client_salt",  five.salt);
+
+    // === iOS 端的等价键（同一份数据，iOS 快手可能读 Gif_* 命名）===
     put(@"Gif_Token",          five.token);
+    put(@"Gif_User",           [five userId]);
     put(@"Gif_Token_Salt",     five.salt);
     put(@"Gif_KwaiClientSalt", five.salt);
-    put(@"Gif_User",           [five userId]);
-    put(@"Gif_LastLoginType",  @"1");      // 1=正常登录
+    put(@"Gif_LastLoginType",  @"1");
 
-    // 第4段（64位hex）与第5段（base64 protobuf）都可能是服务端校验的 serviceToken，
-    // 两个键都写全，避免猜错哪个是快手真正读的。
-    put(@"Gif_ServiceToken",   five.apiSt.length ? five.apiSt : five.passToken);
-    put(@"Gif_PassToken",      five.passToken.length ? five.passToken : five.apiSt);
-    put(@"Gif_H5Token",        five.hToken);
-
-    // 备用键名：不同组件读法不一样，多写不冲突
-    put(@"Gif_ServiceTokenEx", five.passToken);
-    put(@"Gif_ApiSt",          five.apiSt);
-    put(@"serviceToken",       five.passToken);
-    put(@"api_st",             five.apiSt);
-    put(@"egid",               five.apiSt);
-    put(@"KS_EGID",            five.apiSt);
-
-    // === 兜底键（部分版本/组件的备用读法）===
-    put(@"token_client_salt",  five.salt);
+    // 其余段位的备用键（原工具没用到，写了不冲突）
     put(@"ClientSalt",         five.salt);
-    put(@"KS_OUTERID_KEY",     five.egid);
     put(@"uid",                [five userId]);
     put(@"user_id",            [five userId]);
     put(@"userId",             [five userId]);
-
-    // 安卓同名键：实测 iOS 14.8.10 已废弃，但老版本可能还在读，
-    // 写了不占地方也不影响，保留以兼容旧版。
-    put(@"gifshow_token",      five.token);
-    put(@"gifshow_userid",     [five userId]);
+    put(@"Gif_ServiceToken",   five.apiSt.length ? five.apiSt : five.passToken);
+    put(@"Gif_PassToken",      five.passToken.length ? five.passToken : five.apiSt);
+    put(@"Gif_H5Token",        five.hToken);
 
     if (n == 0) {
         [KSLog add:@"✗ 没有可写入的键"];
