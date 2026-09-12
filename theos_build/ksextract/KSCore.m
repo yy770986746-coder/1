@@ -547,11 +547,29 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
 }
 
 /// 用 posix_spawn 调系统命令并捕获 stdout（返回按行拆分的数组）
-/// 注意：必须先把输出重定向到临时文件，再读取 —— 直接管道读在沙盒里容易死锁。
+/// ★ 实测坑（RootHide 无根越狱）：
+///   - App 可能没有独立容器，NSTemporaryDirectory() 指向的路径不可写
+///   - 必须用 /tmp（越狱环境下所有进程都可写）
+///   - 返回空数组时必须能让调用方区分"命令没输出"和"根本没能执行"
 static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *args) {
-    NSString *outPath = [NSTemporaryDirectory()
-                         stringByAppendingPathComponent:@"ks_cmd_out.txt"];
+    // 依次尝试多个可写目录，避免因单一路径不可写而失败
+    NSArray *cand = @[@"/tmp/ks_cmd_out.txt",
+                      @"/var/tmp/ks_cmd_out.txt",
+                      [NSTemporaryDirectory() stringByAppendingPathComponent:@"ks_cmd_out.txt"]];
+    NSString *outPath = nil;
+    for (NSString *p in cand) {
+        NSString *dir = [p stringByDeletingLastPathComponent];
+        if ([[NSFileManager defaultManager] isWritableFileAtPath:dir]) {
+            outPath = p; break;
+        }
+    }
+    if (!outPath) outPath = cand.firstObject;
     [[NSFileManager defaultManager] removeItemAtPath:outPath error:NULL];
+
+    // 先确认可执行文件真实存在
+    if (![[NSFileManager defaultManager] isExecutableFileAtPath:path]) {
+        return nil;   // nil 表示"不可用"，与"无输出"（空数组）区分
+    }
 
     pid_t pid = 0;
     posix_spawn_file_actions_t fa;
@@ -594,45 +612,38 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 ///   因为快手进程不在 mobile 的可见范围内。
 ///   唯一可靠的方式是用 launchctl list 拿到 PID，再 kill -9。
 + (pid_t)pidFromLaunchctlForBundle:(NSString *)bundleID {
-    // ★ 实测坑：/bin/launchctl 是个【相对符号链接】 -> ".jbroot/usr/bin/launchctl"
-    //   无根越狱下这个相对链接在 App 沙盒里解析不了，必须直接用真实路径。
-    NSArray *paths = @[
-        @"/usr/bin/launchctl",        // 真实二进制（首选）
-        @"/var/jb/usr/bin/launchctl",
-        @"/bin/launchctl",
-    ];
-    NSArray *lines = nil;
-    NSString *usedPath = nil;
-    for (NSString *p in paths) {
-        lines = runCmdCapture(p, @[@"list"]);
-        if (lines.count) { usedPath = p; break; }
-        [KSLog add:@"    %@ 无输出", p];
-    }
-    if (!lines.count) {
-        [KSLog add:@"  ⚠ launchctl 所有路径都无输出，改用 /proc 探测"];
-        return [self pidFromProcForBundle:bundleID];
-    }
-    if (usedPath) [KSLog add:@"  使用 %@ 查进程", usedPath];
+    // ★ 实测（RootHide 无根越狱，03:33 真机日志）：
+    //   App 内 posix_spawn 调 launchctl 全部返回"无输出" —— RootHide 给 App 套了
+    //   容器沙盒，外部程序 spawn 不出来。因此把 /proc 探测提为主方案。
+    //
+    // 方案 A：直接遍历 /proc（不依赖任何外部命令，最可靠）
+    pid_t p = [self pidFromProcForBundle:bundleID];
+    if (p > 0) return p;
 
-    // 目标行格式： 42405	0	UIKitApplication:com.jiangjia.gif[035a][rb-legacy]
-    NSString *needle = [NSString stringWithFormat:@"UIKitApplication:%@", bundleID];
-    for (NSString *l in lines) {
-        if (![l containsString:needle]) continue;
-        NSCharacterSet *ws = [NSCharacterSet whitespaceCharacterSet];
-        NSUInteger i = 0;
-        while (i < l.length && [ws characterIsMember:[l characterAtIndex:i]]) i++;
-        NSUInteger start = i;
-        while (i < l.length &&
-               [[NSCharacterSet decimalDigitCharacterSet]
-                characterIsMember:[l characterAtIndex:i]]) i++;
-        if (i > start) {
-            NSString *num = [l substringWithRange:NSMakeRange(start, i - start)];
-            pid_t p = (pid_t)[num intValue];
-            [KSLog add:@"  launchctl 命中 %@ → PID=%d", bundleID, (int)p];
-            return p;
+    // 方案 B：launchctl（部分环境可用）
+    NSArray *paths = @[@"/usr/bin/launchctl", @"/var/jb/usr/bin/launchctl"];
+    for (NSString *lp in paths) {
+        NSArray *lines = runCmdCapture(lp, @[@"list"]);
+        if (!lines) continue;          // nil = 可执行文件不可用
+        if (!lines.count) continue;    // 空数组 = 执行了但无输出
+        NSString *needle = [NSString stringWithFormat:@"UIKitApplication:%@", bundleID];
+        for (NSString *l in lines) {
+            if (![l containsString:needle]) continue;
+            NSCharacterSet *ws = [NSCharacterSet whitespaceCharacterSet];
+            NSUInteger i = 0;
+            while (i < l.length && [ws characterIsMember:[l characterAtIndex:i]]) i++;
+            NSUInteger start = i;
+            while (i < l.length &&
+                   [[NSCharacterSet decimalDigitCharacterSet]
+                    characterIsMember:[l characterAtIndex:i]]) i++;
+            if (i > start) {
+                NSString *num = [l substringWithRange:NSMakeRange(start, i - start)];
+                pid_t r = (pid_t)[num intValue];
+                [KSLog add:@"  launchctl(%@) 命中 → PID=%d", lp, (int)r];
+                return r;
+            }
         }
     }
-    [KSLog add:@"  launchctl 里没有 %@（可能未运行）", bundleID];
     return 0;
 }
 
@@ -642,28 +653,34 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     NSFileManager *fm = [NSFileManager defaultManager];
     // 无根越狱下 /proc 存在两种可能，都试
     NSString *procRoot = @"/proc";
-    NSArray *procs = [fm contentsOfDirectoryAtPath:procRoot error:NULL];
+    NSError *pe = nil;
+    NSArray *procs = [fm contentsOfDirectoryAtPath:procRoot error:&pe];
+    [KSLog add:@"  /proc 读取: %@ 项%@", @(procs.count),
+     pe ? [NSString stringWithFormat:@" (错误: %@)", pe.localizedDescription] : @""];
     if (!procs.count) {
         procRoot = @"/var/jb/proc";
         procs = [fm contentsOfDirectoryAtPath:procRoot error:NULL];
+        [KSLog add:@"  /var/jb/proc 读取: %lu 项", (unsigned long)procs.count];
     }
     if (!procs.count) {
-        [KSLog add:@"  /proc 不可读，无法探测进程"];
+        [KSLog add:@"  ⚠ /proc 不可读（RootHide 沙盒可能屏蔽了它）"];
         return 0;
     }
-    [KSLog add:@"  遍历 %@（%lu 项）", procRoot, (unsigned long)procs.count];
 
     // 快手主进程名固定是 com_kwai_gif
     NSArray *targets = @[@"com_kwai_gif", @"com.kuaishou.nebula"];
     NSCharacterSet *nonDigit = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+    NSUInteger scanned = 0, readable = 0;
 
     for (NSString *d in procs) {
         if ([d rangeOfCharacterFromSet:nonDigit].location != NSNotFound) continue;
+        scanned++;
         NSString *commPath = [NSString stringWithFormat:@"%@/%@/comm", procRoot, d];
         NSString *comm = [NSString stringWithContentsOfFile:commPath
                                                   encoding:NSUTF8StringEncoding
                                                      error:NULL];
         if (!comm.length) continue;
+        readable++;
         comm = [comm stringByTrimmingCharactersInSet:
                 [NSCharacterSet whitespaceAndNewlineCharacterSet]];
         for (NSString *tg in targets) {
@@ -674,7 +691,8 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
             }
         }
     }
-    [KSLog add:@"  /proc 里没找到快手进程"];
+    [KSLog add:@"  /proc 扫描 %lu 个 PID，可读 %lu 个，没找到快手",
+     (unsigned long)scanned, (unsigned long)readable];
     return 0;
 }
 
@@ -1268,34 +1286,56 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     [KSLog add:@"     %@", killed ? @"✓ 已退出" : @"⚠ 未能确认退出"];
 
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSUInteger total = 0;
 
-    // ★★ 直接清空整个容器内容（用户要求：像改机工具那样全清）
-    //    保留容器目录本身，只删里面所有条目 —— 这样 iOS 仍认得容器，
-    //    但快手下次启动会当成全新安装。
+    // ★★ 直接清空容器内容
+    //    实测（RootHide 03:33 日志）：容器根目录本身不可删（"没有访问它的权限"），
+    //    但子目录里的文件可以删。所以要对每个顶层目录【递归清空内容】，
+    //    能删整个目录就删，删不掉就进去把里面的条目全删。
     [KSLog add:@"  ② 清空容器内容: %@", t.dataContainer];
 
-    NSError *dirErr = nil;
-    NSArray *tops = [fm contentsOfDirectoryAtPath:t.dataContainer error:&dirErr];
-    if (!tops) {
-        [KSLog add:@"     ⚠ 读取容器失败: %@", dirErr.localizedDescription];
-    } else {
-        [KSLog add:@"     容器内有 %lu 个条目", (unsigned long)tops.count];
-        for (NSString *item in tops) {
-            // .com.apple.mobile_container_manager.metadata.plist 是容器元数据，
-            // 删掉会导致容器失效，必须保留
-            if ([item isEqualToString:
+    // 递归清空一个目录里的所有条目（目录本身保留）
+    __block NSUInteger removed = 0;
+    __block NSUInteger failed = 0;
+    void (^purge)(NSString *, int) = nil;
+    purge = ^(NSString *dir, int depth) {
+        if (depth > 6) return;
+        NSError *de = nil;
+        NSArray *items = [fm contentsOfDirectoryAtPath:dir error:&de];
+        if (!items) {
+            if (depth <= 1) {
+                [KSLog add:@"     ⚠ 读不了 %@: %@", [dir lastPathComponent],
+                 de.localizedDescription ?: @"未知"];
+            }
+            return;
+        }
+        for (NSString *it in items) {
+            if ([it isEqualToString:
                  @".com.apple.mobile_container_manager.metadata.plist"]) continue;
-
-            NSString *p = [t.dataContainer stringByAppendingPathComponent:item];
-            NSError *e = nil;
-            if ([fm removeItemAtPath:p error:&e]) {
-                total++;
+            NSString *p = [dir stringByAppendingPathComponent:it];
+            BOOL isDir = NO;
+            [fm fileExistsAtPath:p isDirectory:&isDir];
+            NSError *re = nil;
+            if ([fm removeItemAtPath:p error:&re]) {
+                removed++;
+            } else if (isDir) {
+                // 目录删不掉 → 进去把内容清掉
+                purge(p, depth + 1);
+                // 再试一次删空目录
+                if ([fm removeItemAtPath:p error:NULL]) removed++;
+                else failed++;
             } else {
-                [KSLog add:@"     ✗ %@ → %@", item, e.localizedDescription];
+                failed++;
+                if (failed <= 5) {
+                    [KSLog add:@"     ✗ %@: %@", it,
+                     re.localizedDescription ?: @"未知错误"];
+                }
             }
         }
-    }
+    };
+    purge(t.dataContainer, 0);
+    [KSLog add:@"     已删除 %lu 项，失败 %lu 项",
+     (unsigned long)removed, (unsigned long)failed];
+    NSUInteger total = removed;
 
     // AppGroup 共享容器（group.com.kwai.video）里也有账号痕迹
     NSArray *groups = [self appGroupContainers];
