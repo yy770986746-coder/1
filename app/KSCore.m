@@ -1299,53 +1299,68 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 }
 
 /// 从 Keychain 读 did（参考 ksextract 插件：service = "CiInfoKey_Re_N"）
-/// base64 解码后正则提取 UUID；App 若无 Keychain 访问权会返回 nil
+/// base64 解码后正则提取 UUID
+/// ★ 关键：快手 Keychain group 是 "NR2KD6K4TL.com.jiangjia.gif"，
+///   App 的 entitlements 必须声明该 group（已在 build_app.py 的 ENTITLEMENTS 里加上），
+///   否则 SecItemCopyMatching 一律返回 errSecMissingEntitlement。
 + (NSString *)didFromKeychain {
+    // 先试快手自己的 access group，再试默认组
+    NSArray *groups = @[@"NR2KD6K4TL.com.jiangjia.gif",
+                        @"R3Y5DWB26T.com.jiangjia.gif",
+                        @"com.jiangjia.gif",
+                        nil];   // nil = 不指定 group（用默认）
     NSArray *services = @[@"CiInfoKey_Re_N", @"EAccountSDKFakeUUID"];
-    for (NSString *svc in services) {
-        for (int mode = 0; mode < 2; mode++) {
-            NSMutableDictionary *q = [NSMutableDictionary dictionary];
-            q[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
-            q[(__bridge id)kSecAttrService] = svc;
-            if (mode == 1) q[(__bridge id)kSecAttrAccount] = svc;
-            q[(__bridge id)kSecReturnData] = (id)kCFBooleanTrue;
-            q[(__bridge id)kSecMatchLimit] = (id)kSecMatchLimitOne;
 
-            CFTypeRef r = NULL;
-            OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &r);
-            if (st != errSecSuccess || !r) continue;
+    NSRegularExpression *uuidRe =
+        [NSRegularExpression regularExpressionWithPattern:
+         @"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+          "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}" options:0 error:NULL];
 
-            id obj = (__bridge_transfer id)r;
-            NSData *dd = nil;
-            if ([obj isKindOfClass:[NSData class]]) dd = obj;
-            else if ([obj isKindOfClass:[NSDictionary class]])
-                dd = obj[(__bridge id)kSecValueData];
-            if (!dd.length) continue;
+    for (NSString *grp in groups) {
+        for (NSString *svc in services) {
+            for (int mode = 0; mode < 2; mode++) {
+                NSMutableDictionary *q = [NSMutableDictionary dictionary];
+                q[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
+                q[(__bridge id)kSecAttrService] = svc;
+                if (mode == 1) q[(__bridge id)kSecAttrAccount] = svc;
+                if (grp) q[(__bridge id)kSecAttrAccessGroup] = grp;
+                q[(__bridge id)kSecReturnData] = (id)kCFBooleanTrue;
+                q[(__bridge id)kSecMatchLimit] = (id)kSecMatchLimitOne;
 
-            NSString *raw = [[NSString alloc] initWithData:dd
-                                                  encoding:NSUTF8StringEncoding] ?: @"";
-            // 可能是 base64 包了一层
-            NSString *txt = raw;
-            NSData *dec = [[NSData alloc] initWithBase64EncodedString:raw options:0];
-            if (dec) {
-                NSString *t2 = [[NSString alloc] initWithData:dec
-                                                     encoding:NSUTF8StringEncoding];
-                if (t2.length) txt = t2;
-            }
-            // 提 UUID
-            NSRegularExpression *re =
-                [NSRegularExpression regularExpressionWithPattern:
-                 @"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
-                  "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}" options:0 error:NULL];
-            NSTextCheckingResult *m = [re firstMatchInString:txt options:0
-                                                       range:NSMakeRange(0, txt.length)];
-            if (m) {
-                NSString *uuid = [txt substringWithRange:m.range];
-                [KSLog add:@"  did 从 Keychain(%@) 提取", svc];
-                return uuid;
+                CFTypeRef r = NULL;
+                OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &r);
+                if (st != errSecSuccess || !r) continue;
+
+                id obj = (__bridge_transfer id)r;
+                NSData *dd = nil;
+                if ([obj isKindOfClass:[NSData class]]) dd = obj;
+                else if ([obj isKindOfClass:[NSDictionary class]])
+                    dd = obj[(__bridge id)kSecValueData];
+                if (!dd.length) continue;
+
+                NSString *raw = [[NSString alloc] initWithData:dd
+                                                      encoding:NSUTF8StringEncoding] ?: @"";
+                NSString *txt = raw;
+                NSData *dec = [[NSData alloc] initWithBase64EncodedString:raw options:0];
+                if (dec) {
+                    NSString *t2 = [[NSString alloc] initWithData:dec
+                                                         encoding:NSUTF8StringEncoding];
+                    if (t2.length) txt = t2;
+                }
+                NSTextCheckingResult *m = [uuidRe firstMatchInString:txt options:0
+                                                               range:NSMakeRange(0, txt.length)];
+                if (m) {
+                    NSString *uuid = [txt substringWithRange:m.range];
+                    [KSLog add:@"  did 从 Keychain(%@/%@) 提取: %@",
+                     grp ?: @"default", svc, uuid];
+                    return uuid;
+                }
+                [KSLog add:@"  Keychain(%@/%@) 命中但无 UUID，原值前40字符: %.40@",
+                 grp ?: @"default", svc, raw];
             }
         }
     }
+    [KSLog add:@"  Keychain 里没找到 did（可能缺 keychain-access-groups 权限）"];
     return nil;
 }
 

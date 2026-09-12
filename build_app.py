@@ -80,6 +80,17 @@ ENTITLEMENTS = """<?xml version="1.0" encoding="UTF-8"?>
     <true/>
     <key>com.apple.private.launchservices.allowopenwithanyhandler</key>
     <true/>
+    <!-- ★★ 关键：读快手 Keychain 必需
+         快手的 keychain-access-group 是 "NR2KD6K4TL.com.jiangjia.gif"
+         （NR2KD6K4TL = 快手 Team ID）。
+         没有这一项，独立 App 读不到快手的 did/egid/token，
+         「读取当前」就只能从 plist 拿不完整的数据。 -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>NR2KD6K4TL.com.jiangjia.gif</string>
+        <string>R3Y5DWB26T.com.jiangjia.gif</string>
+        <string>com.jiangjia.gif</string>
+    </array>
 </dict>
 </plist>
 """
