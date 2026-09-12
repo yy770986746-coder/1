@@ -223,86 +223,27 @@ static NSLock *gLock = nil;
     return @[KS_BID_MAIN, KS_BID_LITE, KS_BID_OVERSEA];
 }
 
-/// 通过 LSApplicationWorkspace 查已安装 App 的容器路径（最可靠）
-/// 返回 nil 表示这个 bundleID 确实没装
-+ (NSString *)lsWorkspaceDataContainer:(NSString *)bid {
-    Class ws = NSClassFromString(@"LSApplicationWorkspace");
-    if (!ws) return nil;
-
-    id inst = ((id(*)(id, SEL))objc_msgSend)(ws,
-                NSSelectorFromString(@"defaultWorkspace"));
-    if (!inst) return nil;
-
-    id proxy = ((id(*)(id, SEL, id))objc_msgSend)(inst,
-                  NSSelectorFromString(@"applicationProxyForIdentifier:"), bid);
-    if (!proxy) return nil;
-
-    // dataContainerURL 优先
-    if ([proxy respondsToSelector:NSSelectorFromString(@"dataContainerURL")]) {
-        id url = ((id(*)(id, SEL))objc_msgSend)(proxy,
-                    NSSelectorFromString(@"dataContainerURL"));
-        if (url) {
-            NSString *p = [url isKindOfClass:[NSURL class]]
-                            ? [(NSURL *)url path] : (NSString *)url;
-            if (p.length) return p;
-        }
-    }
-    // 退回 containerURL
-    if ([proxy respondsToSelector:NSSelectorFromString(@"containerURL")]) {
-        id url = ((id(*)(id, SEL))objc_msgSend)(proxy,
-                    NSSelectorFromString(@"containerURL"));
-        if (url) {
-            NSString *p = [url isKindOfClass:[NSURL class]]
-                            ? [(NSURL *)url path] : (NSString *)url;
-            if (p.length) return p;
-        }
-    }
-    return nil;
-}
-
-/// App .app 所在路径（bundle 容器）
-+ (NSString *)lsWorkspaceBundlePath:(NSString *)bid {
-    Class ws = NSClassFromString(@"LSApplicationWorkspace");
-    if (!ws) return nil;
-    id inst = ((id(*)(id, SEL))objc_msgSend)(ws,
-                NSSelectorFromString(@"defaultWorkspace"));
-    if (!inst) return nil;
-    id proxy = ((id(*)(id, SEL, id))objc_msgSend)(inst,
-                  NSSelectorFromString(@"applicationProxyForIdentifier:"), bid);
-    if (!proxy) return nil;
-
-    if ([proxy respondsToSelector:NSSelectorFromString(@"bundleURL")]) {
-        id url = ((id(*)(id, SEL))objc_msgSend)(proxy,
-                    NSSelectorFromString(@"bundleURL"));
-        if (url) {
-            NSString *p = [url isKindOfClass:[NSURL class]]
-                            ? [(NSURL *)url path] : (NSString *)url;
-            if (p.length) return p;
-        }
-    }
-    return nil;
-}
-
 /// 从 .app 的 Info.plist 反查真正的 bundleID
 /// （有些版本/马甲包目录名和 bundleID 不一致，靠目录名匹配会漏）
+/// 注意：只读 Info.plist 文件，不调任何私有 API —— 私有 API 在 iOS 15 上
+///       极易因 selector 不响应而抛 unrecognized selector，直接 SIGABRT。
 + (NSString *)bundleIDFromAppPath:(NSString *)appPath {
     NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
                           [appPath stringByAppendingPathComponent:@"Info.plist"]];
     return info[@"CFBundleIdentifier"];
 }
 
-/// 用私有 API 拿容器路径（App 带平台权限时可用）
+/// 容器归属：读容器根下的元数据 plist 拿 MCMMetadataIdentifier
++ (NSString *)identifierOfContainer:(NSString *)container {
+    NSString *meta = [container stringByAppendingPathComponent:
+                      @".com.apple.mobile_container_manager.metadata.plist"];
+    NSDictionary *md = [NSDictionary dictionaryWithContentsOfFile:meta];
+    return md[@"MCMMetadataIdentifier"];
+}
+
+/// 拿容器路径（纯文件系统遍历，不用私有 API）
 + (NSString *)containerForBundleID:(NSString *)bid {
     NSFileManager *fm = [NSFileManager defaultManager];
-
-    // 1) 先问 LSApplicationWorkspace —— 系统标准接口，最准
-    NSString *lsPath = [self lsWorkspaceDataContainer:bid];
-    if (lsPath && [fm fileExistsAtPath:lsPath]) {
-        [KSLog add:@"  [沙盒] LSApplicationWorkspace 命中: %@", lsPath];
-        return lsPath;
-    }
-
-    // 2) 标准容器路径探测
     NSArray *roots = @[
         @"/var/mobile/Containers/Data/Application",
         @"/private/var/mobile/Containers/Data/Application",
@@ -316,34 +257,22 @@ static NSLock *gLock = nil;
              err.localizedDescription ?: @"未知错误"];
             continue;
         }
-        [KSLog add:@"  [沙盒] %@ 下 %lu 个容器，逐个比对", root,
-         (unsigned long)dirs.count];
-
         for (NSString *d in dirs) {
             NSString *container = [root stringByAppendingPathComponent:d];
-            // 读 .com.apple.mobile_container_manager.metadata.plist 确认归属
-            NSString *meta = [container stringByAppendingPathComponent:
-                              @".com.apple.mobile_container_manager.metadata.plist"];
-            NSDictionary *md = [NSDictionary dictionaryWithContentsOfFile:meta];
-            if ([md[@"MCMMetadataIdentifier"] isEqualToString:bid]) {
-                [KSLog add:@"  [沙盒] 扫描命中: %@", container];
+            NSString *ident = [self identifierOfContainer:container];
+            if ([ident isEqualToString:bid]) {
+                [KSLog add:@"  [沙盒] 命中: %@", container];
                 return container;
             }
         }
+        [KSLog add:@"  [沙盒] %@ 下 %lu 个容器，未匹配", root,
+         (unsigned long)dirs.count];
     }
     return nil;
 }
 
 + (NSString *)bundlePathForBundleID:(NSString *)bid {
     NSFileManager *fm = [NSFileManager defaultManager];
-
-    // 1) LSApplicationWorkspace 优先
-    NSString *lsBundle = [self lsWorkspaceBundlePath:bid];
-    if (lsBundle && [fm fileExistsAtPath:lsBundle]) {
-        return lsBundle;
-    }
-
-    // 2) 目录扫描（同时用 Info.plist 反查，兼容目录名与 bundleID 不同的情况）
     NSArray *roots = @[
         @"/var/containers/Bundle/Application",
         @"/private/var/containers/Bundle/Application",
@@ -358,12 +287,13 @@ static NSLock *gLock = nil;
         }
         for (NSString *d in dirs) {
             NSString *sub = [root stringByAppendingPathComponent:d];
-            // 先按标准命名试
+            // 1) 先按标准命名试（快路径）
             NSString *p = [sub stringByAppendingPathComponent:
                            [NSString stringWithFormat:@"%@.app", bid]];
             if ([fm fileExistsAtPath:p]) return p;
 
-            // 再扫这个目录下所有 .app，用 Info.plist 反查 bundleID
+            // 2) 扫这一层所有 .app，用 Info.plist 反查真实 bundleID
+            //    ★ 快手真实情况：目录名 com_kwai_gif.app，bundleID com.jiangjia.gif
             NSArray *apps = [fm contentsOfDirectoryAtPath:sub error:NULL];
             for (NSString *a in apps) {
                 if (![a hasSuffix:@".app"]) continue;
@@ -493,20 +423,25 @@ static NSLock *gLock = nil;
         return YES;
     }
 
-    // 2) LSApplicationWorkspace 私有接口
-    Class ws = NSClassFromString(@"LSApplicationWorkspace");
-    if (ws) {
-        id inst = ((id(*)(id, SEL))objc_msgSend)(ws,
-                    NSSelectorFromString(@"defaultWorkspace"));
-        if (inst) {
-            BOOL ok = ((BOOL(*)(id, SEL, id))objc_msgSend)(inst,
-                        NSSelectorFromString(@"openApplicationWithBundleID:"), bid);
-            if (ok) {
-                [KSLog add:@"通过 LSApplicationWorkspace 拉起 %@", bid];
-                return YES;
+    // 2) LSApplicationWorkspace 私有接口（全部包在 @try 里，防 unrecognized selector 崩溃）
+    @try {
+        Class ws = NSClassFromString(@"LSApplicationWorkspace");
+        if (ws && [ws respondsToSelector:NSSelectorFromString(@"defaultWorkspace")]) {
+            id inst = ((id(*)(id, SEL))objc_msgSend)(ws,
+                        NSSelectorFromString(@"defaultWorkspace"));
+            SEL sel = NSSelectorFromString(@"openApplicationWithBundleID:");
+            if (inst && [inst respondsToSelector:sel]) {
+                BOOL ok = ((BOOL(*)(id, SEL, id))objc_msgSend)(inst, sel, bid);
+                if (ok) {
+                    [KSLog add:@"通过 LSApplicationWorkspace 拉起 %@", bid];
+                    return YES;
+                }
             }
         }
+    } @catch (NSException *e) {
+        [KSLog add:@"⚠ 私有接口不可用(%@)，请手动点快手图标", e.reason ?: @"未知"];
     }
+
     [KSLog add:@"✗ 拉起失败，请手动点击快手图标"];
     return NO;
 }

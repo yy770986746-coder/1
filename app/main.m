@@ -37,9 +37,14 @@
     self.title = @"快手上号器";
     [self buildUI];
 
-    // 探测目标 App
+    // 探测目标 App（全程包异常保护，任何探测失败都不该让 App 起不来）
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        KSTarget *t = [KSTarget detect];
+        KSTarget *t = nil;
+        @try {
+            t = [KSTarget detect];
+        } @catch (NSException *e) {
+            [KSLog add:@"✗ 探测异常: %@", e.reason ?: @"未知"];
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             self.target = t;
             [self refreshEnv];
