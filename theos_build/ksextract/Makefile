@@ -9,6 +9,7 @@ APPLICATION_NAME = KSExtract
 KSExtract_FILES = main.m KSCore.m
 KSExtract_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-deprecated-declarations
 KSExtract_FRAMEWORKS = UIKit Foundation
+KSExtract_PRIVATE_FRAMEWORKS = MobileCoreServices
 KSExtract_CODESIGN_FLAGS = -Sentitlements.plist
 KSExtract_INSTALL_PATH = /var/jb/Applications
 

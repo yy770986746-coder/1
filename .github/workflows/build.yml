@@ -117,6 +117,17 @@ jobs:
           file out/KSExtract.app/KSExtract | grep -q "arm64" \
             || { echo "编译产物不是 arm64"; exit 1; }
 
+          # ★ 生成 App 图标（缺图标桌面显示白板，部分系统不显示）
+          cd ..
+          python3 -c "
+import sys
+sys.path.insert(0, '.')
+import build_app
+ok = build_app._write_icons('xcode_project/out/KSExtract.app')
+print('图标生成:', '成功' if ok else '跳过(无 Pillow)')
+"
+          ls -la xcode_project/out/KSExtract.app/
+
       - name: 注入 entitlements 签名
         run: |
           set -e

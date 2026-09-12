@@ -27,8 +27,35 @@
         <integer>1</integer>
         <integer>2</integer>
     </array>
-    <key>UILaunchStoryboardName</key>
-    <string></string>
+    <!-- ★ 启动必需：缺这些 SpringBoard 会拒绝拉起，表现为"点了没反应" -->
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>iPhoneOS</string>
+    </array>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>DTPlatformName</key>
+    <string>iphoneos</string>
+    <key>DTPlatformVersion</key>
+    <string>16.1</string>
+    <key>DTSDKName</key>
+    <string>iphoneos16.1</string>
+    <!-- ★ 图标：没有图标桌面会显示白板，部分系统直接不显示 -->
+    <key>CFBundleIcons</key>
+    <dict>
+        <key>CFBundlePrimaryIcon</key>
+        <dict>
+            <key>CFBundleIconFiles</key>
+            <array>
+                <string>AppIcon60x60</string>
+            </array>
+            <key>CFBundleIconName</key>
+            <string>AppIcon</string>
+        </dict>
+    </dict>
+    <!-- ★ 空字符串会导致启动异常，用系统默认启动页 -->
+    <key>UILaunchScreen</key>
+    <dict/>
     <key>UIRequiredDeviceCapabilities</key>
     <array>
         <string>arm64</string>
@@ -37,6 +64,22 @@
     <array>
         <string>UIInterfaceOrientationPortrait</string>
     </array>
+    <key>UISupportedInterfaceOrientations~iphone</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+    </array>
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
     <key>LSApplicationQueriesSchemes</key>
     <array>
         <string>com.jiangjia.gif</string>

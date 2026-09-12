@@ -113,8 +113,35 @@ INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
         <integer>1</integer>
         <integer>2</integer>
     </array>
-    <key>UILaunchStoryboardName</key>
-    <string></string>
+    <!-- ★ 启动必需：缺这些 SpringBoard 会拒绝拉起，表现为"点了没反应" -->
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>iPhoneOS</string>
+    </array>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>DTPlatformName</key>
+    <string>iphoneos</string>
+    <key>DTPlatformVersion</key>
+    <string>16.1</string>
+    <key>DTSDKName</key>
+    <string>iphoneos16.1</string>
+    <!-- ★ 图标：没有图标桌面会显示白板，部分系统直接不显示 -->
+    <key>CFBundleIcons</key>
+    <dict>
+        <key>CFBundlePrimaryIcon</key>
+        <dict>
+            <key>CFBundleIconFiles</key>
+            <array>
+                <string>AppIcon60x60</string>
+            </array>
+            <key>CFBundleIconName</key>
+            <string>AppIcon</string>
+        </dict>
+    </dict>
+    <!-- ★ 空字符串会导致启动异常，用系统默认启动页 -->
+    <key>UILaunchScreen</key>
+    <dict/>
     <key>UIRequiredDeviceCapabilities</key>
     <array>
         <string>arm64</string>
@@ -123,6 +150,22 @@ INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
     <array>
         <string>UIInterfaceOrientationPortrait</string>
     </array>
+    <key>UISupportedInterfaceOrientations~iphone</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+    </array>
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
     <key>LSApplicationQueriesSchemes</key>
     <array>
         <string>com.jiangjia.gif</string>
@@ -700,6 +743,41 @@ def _make_ar(members):
     return buf.getvalue()
 
 
+def _make_icon_png(size=120):
+    """生成一个简单的 App 图标（橙底 + 白色闪电），避免桌面白板"""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    # 圆角橙底
+    r = int(size * 0.22)
+    d.rounded_rectangle([0, 0, size - 1, size - 1], radius=r, fill=(255, 122, 0, 255))
+    # 白色闪电
+    s = size / 100.0
+    bolt = [(58, 12), (30, 56), (48, 56), (40, 88), (70, 42), (51, 42)]
+    d.polygon([(x * s, y * s) for x, y in bolt], fill=(255, 255, 255, 255))
+    return img
+
+
+def _write_icons(app_dir):
+    """把图标写进 .app，返回是否成功"""
+    img = _make_icon_png(120)
+    if img is None:
+        return False
+    try:
+        # 现代命名（配合 CFBundleIconFiles 里的 AppIcon60x60）
+        img.resize((120, 120)).save(os.path.join(app_dir, "AppIcon60x60@2x.png"))
+        img.resize((60, 60)).save(os.path.join(app_dir, "AppIcon60x60@1x.png"))
+        img.resize((180, 180)).save(os.path.join(app_dir, "AppIcon60x60@3x.png"))
+        img.resize((76, 76)).save(os.path.join(app_dir, "AppIcon76x76@1x.png"))
+        img.resize((152, 152)).save(os.path.join(app_dir, "AppIcon76x76@2x.png"))
+        return True
+    except Exception:
+        return False
+
+
 def _w(path, content):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
@@ -719,11 +797,13 @@ def main():
         pack_deb(args.pack)
         return 0
 
+    # 两个开关可以同时给，别用 return 把第二个吞掉
+    only = args.theos or args.xcode
     if args.theos:
         gen_theos()
-        return 0
     if args.xcode:
         gen_xcode()
+    if only:
         return 0
 
     gen_theos()
