@@ -464,7 +464,8 @@
 #pragma mark - 辅助
 
 - (void)setBusy:(BOOL)busy {
-    self.busy = busy;
+    // ★ 必须写实例变量 _busy。写 self.busy 会再次调用本方法 → 无限递归 → 栈溢出 SIGSEGV
+    _busy = busy;
     self.btnLogin.enabled = !busy;
     self.btnWipe.enabled = !busy;
     self.btnLogin.alpha = busy ? 0.5 : 1.0;
