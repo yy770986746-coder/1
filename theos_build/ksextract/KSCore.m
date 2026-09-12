@@ -528,6 +528,8 @@ static NSLock *gLock = nil;
 + (NSDictionary *)loadPlistAt:(NSString *)path;
 + (NSString *)didFromPlistDeep:(NSDictionary *)d;
 + (NSString *)egidFromContainerScan:(KSTarget *)t;
++ (NSString *)egidScan:(NSString *)knownDid;
++ (NSString *)containerRoot;
 @end
 
 @implementation KSInjector
@@ -1285,10 +1287,13 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     f.did = did ?: @"";
 
     // === 第4段 egid ===
-    // 参考实现：在【任意文本】里找 DFP + 40~64 位 hex（不只日志，还有网络缓存/数据库）
-    NSString *egid = [self egidFromLogs:t];
+    // ★ 实测判据（来自真机 Cache.db-wal）：
+    //   请求参数串里 did 和 egid 同现："...;did=<UUID>;didTag=0;egid=DFP...;gid=DFP...;"
+    //   缓存里会有多个历史 DFP（每次改机都生成新的），
+    //   所以【优先选与当前 did 同现的那个】，而不是随便取一个。
+    NSString *egid = [self egidScan:f.did];          // 与 did 关联查找（最可靠）
+    if (!egid.length) egid = [self egidFromLogs:t];  // global_id=DFP
     if (!egid.length) egid = pick(@[@"KS_OUTERID_KEY"]);
-    if (!egid.length) egid = [self egidFromContainerScan:t];
     f.egid = egid ?: @"";
 
     // === 第5段 api_st ===
@@ -1388,41 +1393,103 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 }
 
 /// 扫描容器内的文本文件找 DFP 指纹（参考插件：任意文本里 DFP+40~64hex）
+/// ★ 实测（真机 Cache.db-wal 分析）：
+///   请求参数串里 did 和 egid 同现，形如
+///     "...;did=BEA9D9B2-121F-27F4-CB7B-6FD40BBD4AF6;didTag=0;egid=DFP248629...;gid=DFP248629...;"
+///   而缓存里存在多个历史 DFP（设备每次改机/重置都会生成新的）。
+///   所以判据是：找【与当前 did 出现在同一条请求里】的那个 DFP，而不是随便找一个。
 + (NSString *)egidFromContainerScan:(KSTarget *)t {
+    return [self egidScan:t.did];
+}
+
+/// 扫描容器文本文件找 egid
+/// @param knownDid 已知的 did（UUID），用于锁定同现的 DFP；可为空
++ (NSString *)egidScan:(NSString *)knownDid {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSRegularExpression *re =
+    NSRegularExpression *dfpRe =
         [NSRegularExpression regularExpressionWithPattern:
          @"DFP[0-9A-Fa-f]{40,64}" options:0 error:NULL];
 
-    // 重点扫描这些可能含 DFP 的目录
-    NSArray *subs = @[@"Documents/mmkv", @"Library/Caches",
-                      @"Documents", @"Library/KWApp"];
+    // 优先扫描网络缓存（实测 DFP 就在这里）
+    NSArray *subs = @[
+        @"Library/Caches/com.jiangjia.gif",
+        @"Library/Caches/com.jiangjia.gif/KSURLCache",
+        @"Library/Caches/ObiwanLogs",
+        @"Documents/mmkv",
+        @"Library/Caches",
+        @"Documents/com.hawkeye.data",
+    ];
+
+    NSString *fallback = nil;     // 没锁定 did 时，用出现次数最多的
+    NSMutableDictionary *counter = [NSMutableDictionary dictionary];
     NSUInteger scanned = 0;
-    for (NSString *s in subs) {
-        NSString *dir = [t.dataContainer stringByAppendingPathComponent:s];
+
+    for (NSString *sub in subs) {
+        NSString *dir = [sub hasPrefix:@"/"] ? sub
+                       : [[self containerRoot] stringByAppendingPathComponent:sub];
         NSDirectoryEnumerator *en = [fm enumeratorAtPath:dir];
         for (NSString *rel in en) {
-            if (scanned++ > 400) break;
+            if (scanned++ > 500) break;
             NSString *full = [dir stringByAppendingPathComponent:rel];
             BOOL isDir = NO;
             if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
             NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
-            if ([attr fileSize] > 3 * 1024 * 1024) continue;
+            if ([attr fileSize] > 4 * 1024 * 1024) continue;
+
             NSData *data = [NSData dataWithContentsOfFile:full];
             if (!data.length) continue;
             NSString *txt = [[NSString alloc] initWithData:data
                                                   encoding:NSISOLatin1StringEncoding];
             if (!txt.length) continue;
-            NSTextCheckingResult *m = [re firstMatchInString:txt options:0
-                                                       range:NSMakeRange(0, txt.length)];
-            if (m) {
+
+            // ① 若已知 did，找与它同现的 DFP
+            if (knownDid.length && [txt containsString:knownDid]) {
+                NSRange dr = [txt rangeOfString:knownDid];
+                // 在 did 前后各 400 字符窗口内找 DFP
+                NSUInteger lo = dr.location > 400 ? dr.location - 400 : 0;
+                NSUInteger hi = MIN(txt.length, dr.location + dr.length + 400);
+                NSRange win = NSMakeRange(lo, hi - lo);
+                NSTextCheckingResult *m = [dfpRe firstMatchInString:txt options:0 range:win];
+                if (m) {
+                    NSString *dfp = [txt substringWithRange:m.range];
+                    [KSLog add:@"  egid 与 did 同现于 %@/%@ → %@",
+                     [sub lastPathComponent], rel, dfp];
+                    return dfp;
+                }
+            }
+
+            // ② 兜底：统计出现次数
+            NSArray *ms = [dfpRe matchesInString:txt options:0
+                                           range:NSMakeRange(0, txt.length)];
+            for (NSTextCheckingResult *m in ms) {
                 NSString *dfp = [txt substringWithRange:m.range];
-                [KSLog add:@"  egid 从 %@/%@ 提取", s, rel];
-                return dfp;
+                counter[dfp] = @([counter[dfp] integerValue] + 1);
+                if (!fallback) fallback = dfp;
             }
         }
     }
+
+    // 取出现次数最多的
+    NSString *best = nil;
+    NSInteger bestN = 0;
+    for (NSString *k in counter) {
+        NSInteger n = [counter[k] integerValue];
+        if (n > bestN) { bestN = n; best = k; }
+    }
+    if (best) {
+        [KSLog add:@"  egid 取出现最多的 DFP（%ld 次）→ %@", (long)bestN, best];
+        return best;
+    }
     return nil;
+}
+
+/// 快手数据容器根（缓存一份，避免重复探测）
++ (NSString *)containerRoot {
+    static NSString *cached = nil;
+    if (cached) return cached;
+    cached = [KSTarget containerForBundleID:KS_BID_MAIN];
+    if (!cached) cached = [KSTarget containerForBundleID:@"com.kuaishou.nebula"];
+    return cached ?: @"";
 }
 
 /// 老版快手的 token 在 kwapp_host_path_db.db 的 host_path_table 里（host_id-owner_id）
