@@ -59,59 +59,59 @@ jobs:
           # 避免被工程生成器重建目录而把 cwd 删掉。
           cd xcode_project
 
-          echo "=== 源码一致性检查 ==="
-          diff -q main.m  ../app/main.m  || { echo "main.m 与 app/ 不一致"; exit 1; }
-          diff -q KSCore.m ../app/KSCore.m || { echo "KSCore.m 与 app/ 不一致"; exit 1; }
-          diff -q KSCore.h ../app/KSCore.h || { echo "KSCore.h 与 app/ 不一致"; exit 1; }
+          # app/ 是唯一权威源码，构建前强制同步，避免多份拷贝走样
+          echo "=== 从 app/ 同步源码 ==="
+          cp ../app/main.m ../app/KSCore.m ../app/KSCore.h .
+          ls -la main.m KSCore.m KSCore.h
 
           rm -rf out
           mkdir -p out
 
-          # ---- 主路径：xcodebuild ----
-          echo "=== 使用 xcodebuild ==="
-          xcodebuild \
-            -project KSExtract.xcodeproj \
-            -scheme KSExtract \
-            -sdk iphoneos \
-            -configuration Release \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CONFIGURATION_BUILD_DIR="$PWD/out" \
-            build || echo "xcodebuild 失败，改用 clang 兜底"
+          # ---- 主路径：clang 直接编 ----
+          # 手工生成的 pbxproj 在 runner 上不稳定，clang 这条路最可控。
+          echo "=== clang 直接编译 ==="
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          APP=out/KSExtract.app
+          mkdir -p "$APP"
+          cp Info.plist "$APP/"
 
-          # ---- 兜底：clang 直接编 ----
-          # 必须带 -lobjc（objc_msgSend 需要）与全部用到的 framework
-          if [ ! -f "out/KSExtract.app/KSExtract" ]; then
-            echo "=== 回退到 clang 直接编译 ==="
-            SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-            echo "SDK: $SDK"
-            APP=out/KSExtract.app
-            rm -rf "$APP"
-            mkdir -p "$APP"
-            cp Info.plist "$APP/"
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -fmodules \
+            -lobjc \
+            -framework UIKit \
+            -framework Foundation \
+            -framework CoreFoundation \
+            -framework CoreServices \
+            -Wno-deprecated-declarations \
+            -Wno-unused-function \
+            -o "$APP/KSExtract" \
+            main.m KSCore.m
 
-            xcrun -sdk iphoneos clang \
-              -arch arm64 \
-              -isysroot "$SDK" \
-              -miphoneos-version-min=14.0 \
-              -fobjc-arc \
-              -fmodules \
-              -lobjc \
-              -framework UIKit \
-              -framework Foundation \
-              -framework CoreFoundation \
-              -framework CoreServices \
-              -framework MobileCoreServices \
-              -Wno-deprecated-declarations \
-              -Wno-unused-function \
-              -o "$APP/KSExtract" \
-              main.m KSCore.m
-            echo "clang 编译完成"
+          echo "clang 编译完成"
+
+          # ---- 参考路径：xcodebuild（失败不影响产物）----
+          if [ ! -f "$APP/KSExtract" ]; then
+            echo "=== clang 失败，尝试 xcodebuild ==="
+            xcodebuild \
+              -project KSExtract.xcodeproj \
+              -scheme KSExtract \
+              -sdk iphoneos \
+              -configuration Release \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              CONFIGURATION_BUILD_DIR="$PWD/out" \
+              build
           fi
 
           echo "=== 产物 ==="
           ls -la out/KSExtract.app/
+          test -f out/KSExtract.app/KSExtract || { echo "没有产出可执行文件"; exit 1; }
           file out/KSExtract.app/KSExtract
           # 必须是 arm64 Mach-O，否则后面打包出来是废包
           file out/KSExtract.app/KSExtract | grep -q "arm64" \

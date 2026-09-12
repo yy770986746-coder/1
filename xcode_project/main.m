@@ -381,7 +381,8 @@
     self.btnLogin.enabled = !busy;
     self.btnWipe.enabled = !busy;
     self.btnLogin.alpha = busy ? 0.5 : 1.0;
-    [busy ? self.spinner startAnimating() : self.spinner stopAnimating()];
+    if (busy) [self.spinner startAnimating];
+    else      [self.spinner stopAnimating];
     if (busy) [self.btnLogin setTitle:@"处理中..." forState:UIControlStateNormal];
     else      [self.btnLogin setTitle:@"一 键 上 号" forState:UIControlStateNormal];
 }

@@ -5,10 +5,16 @@
 
 #import "KSCore.h"
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 #import <sys/stat.h>
+#import <sys/sysctl.h>
+#import <sys/types.h>
 #import <spawn.h>
 #import <signal.h>
 #import <dlfcn.h>
+#import <stdlib.h>
+#import <unistd.h>
 
 extern char **environ;
 
@@ -440,7 +446,7 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     // ---- 写入登录键 ----
     // 对照组：安卓版只写 gifshow_token / gifshow_userid / token_client_salt
     // iOS 侧快手用的是 Gif_* 命名空间，两套都写，确保命中
-    NSUInteger n = 0;
+    __block NSUInteger n = 0;
     void (^put)(NSString *, NSString *) = ^(NSString *k, NSString *v) {
         if (k.length && v.length) { plist[k] = v; n++; }
     };
@@ -547,7 +553,8 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:t.prefsPath];
     if (!d) return nil;
 
-    id pick = ^NSString *(NSArray *keys) {
+    // 取第一个存在且非空的字符串值（block 直接调用，ARC 下不能当函数指针强转）
+    NSString *(^pick)(NSArray *) = ^NSString *(NSArray *keys) {
         for (NSString *k in keys) {
             id v = d[k];
             if (v && [v isKindOfClass:[NSString class]] && [v length]) return v;
@@ -556,11 +563,11 @@ static int runCmd(NSString *path, NSArray<NSString *> *args) {
     };
 
     KSFive *f = [KSFive new];
-    f.token = ((NSString *(*)(NSArray *))pick)(@[@"Gif_Token", @"gifshow_token", @"token"]) ?: @"";
-    f.salt  = ((NSString *(*)(NSArray *))pick)(@[@"Gif_Token_Salt", @"Gif_KwaiClientSalt",
-                                                 @"token_client_salt", @"ClientSalt"]) ?: @"";
-    f.apiSt = ((NSString *(*)(NSArray *))pick)(@[@"Gif_ServiceToken", @"api_st"]) ?: @"";
-    f.egid  = ((NSString *(*)(NSArray *))pick)(@[@"KS_OUTERID_KEY", @"egid"]) ?: @"";
+    f.token = pick(@[@"Gif_Token", @"gifshow_token", @"token"]) ?: @"";
+    f.salt  = pick(@[@"Gif_Token_Salt", @"Gif_KwaiClientSalt",
+                     @"token_client_salt", @"ClientSalt"]) ?: @"";
+    f.apiSt = pick(@[@"Gif_ServiceToken", @"api_st"]) ?: @"";
+    f.egid  = pick(@[@"KS_OUTERID_KEY", @"egid"]) ?: @"";
     return f.token.length ? f : nil;
 }
 
