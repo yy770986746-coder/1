@@ -1,4 +1,4 @@
-// 诊断版 v7：正确读取 CiInfoKey_Re_N（返回的是 NSString 不是 NSData）
+// 诊断版 v8：解析 CiInfoKey_Re_N 的 bplist，输出完整明文内容
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
 #import <UIKit/UIKit.h>
@@ -40,7 +40,41 @@ static void ks_log(NSString *fmt, ...) {
     } @catch (NSException *e) {}
 }
 
-/// 通用 dump：不假设返回类型
+/// 递归 dump 对象
+static void ks_walk(id o, int depth) {
+    NSString *pad = [@"" stringByPaddingToLength:(NSUInteger)(depth * 2)
+                                      withString:@" " startingAtIndex:0];
+    if ([o isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)o;
+        for (id k in d) {
+            ks_log(@"%@  %@:", pad, k);
+            ks_walk(d[k], depth + 1);
+        }
+    } else if ([o isKindOfClass:[NSArray class]]) {
+        NSArray *a = (NSArray *)o;
+        for (NSUInteger i = 0; i < a.count; i++) {
+            ks_log(@"%@  [%lu]", pad, (unsigned long)i);
+            ks_walk(a[i], depth + 1);
+        }
+    } else if ([o isKindOfClass:[NSData class]]) {
+        NSData *d = (NSData *)o;
+        ks_log(@"%@  NSData %lu 字节", pad, (unsigned long)d.length);
+        NSString *t = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+        if (t.length) ks_log(@"%@  ★ 文本: %@", pad, t);
+    } else {
+        NSString *s = [o description];
+        ks_log(@"%@  %@ (%@)", pad, s, NSStringFromClass([o class]));
+        // base64 解码尝试
+        if ([o isKindOfClass:[NSString class]] && s.length > 20) {
+            NSData *dec = [[NSData alloc] initWithBase64EncodedString:s options:0];
+            if (dec.length) {
+                NSString *t2 = [[NSString alloc] initWithData:dec encoding:NSUTF8StringEncoding];
+                if (t2.length) ks_log(@"%@  ★ base64解码: %@", pad, t2);
+            }
+        }
+    }
+}
+
 static void ks_dumpKey(NSString *key) {
     @try {
         NSDictionary *q = @{
@@ -52,50 +86,32 @@ static void ks_dumpKey(NSString *key) {
         };
         CFTypeRef r = NULL;
         OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &r);
-        ks_log(@"---- %@ (status=%d) ----", key, (int)st);
-        if (st != errSecSuccess || !r) {
-            ks_log(@"     (读取失败)");
-            return;
-        }
+        ks_log(@"====== %@ (status=%d) ======", key, (int)st);
+        if (st != errSecSuccess || !r) { ks_log(@"  (失败)"); return; }
 
-        // r 可能是 NSData / NSDictionary / NSString
         id obj = (__bridge_transfer id)r;
+        if (![obj isKindOfClass:[NSDictionary class]]) {
+            ks_walk(obj, 1);
+            return;
+        }
+        NSDictionary *d = (NSDictionary *)obj;
+        NSData *data = d[(__bridge id)kSecValueData];
 
-        if ([obj isKindOfClass:[NSString class]]) {
-            ks_log(@"     类型: NSString");
-            ks_log(@"     ★ 值: %@", obj);
-            return;
+        ks_log(@"  data 长度: %lu", (unsigned long)data.length);
+
+        // 试 bplist 解析
+        NSError *err = nil;
+        id parsed = [NSPropertyListSerialization propertyListWithData:data
+                                                             options:0
+                                                              format:NULL
+                                                               error:&err];
+        if (parsed) {
+            ks_log(@"  ★ bplist 解析成功:");
+            ks_walk(parsed, 2);
+        } else {
+            ks_log(@"  bplist 解析失败: %@", err.localizedDescription);
+            ks_walk(data, 2);
         }
-        if ([obj isKindOfClass:[NSData class]]) {
-            NSData *d = (NSData *)obj;
-            ks_log(@"     类型: NSData (%lu 字节)", (unsigned long)d.length);
-            NSString *t = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-            if (t.length) ks_log(@"     ★ 值: %@", t);
-            return;
-        }
-        if ([obj isKindOfClass:[NSDictionary class]]) {
-            NSDictionary *d = (NSDictionary *)obj;
-            ks_log(@"     类型: NSDictionary, keys=%@",
-                   [[d allKeys] componentsJoinedByString:@","]);
-            id acct = d[(__bridge id)kSecAttrAccount];
-            if ([acct isKindOfClass:[NSString class]]) ks_log(@"     account: %@", acct);
-            id vd = d[(__bridge id)kSecValueData];
-            if ([vd isKindOfClass:[NSData class]]) {
-                NSData *dd = (NSData *)vd;
-                ks_log(@"     data: %lu 字节", (unsigned long)dd.length);
-                NSString *t = [[NSString alloc] initWithData:dd encoding:NSUTF8StringEncoding];
-                if (t.length) ks_log(@"     ★ 文本: %@", t);
-                NSMutableString *hex = [NSMutableString string];
-                const uint8_t *b = (const uint8_t *)dd.bytes;
-                for (NSUInteger i = 0; i < MIN((NSUInteger)300, dd.length); i++)
-                    [hex appendFormat:@"%02x", b[i]];
-                ks_log(@"     hex: %@", hex);
-            } else if ([vd isKindOfClass:[NSString class]]) {
-                ks_log(@"     ★ data(字符串): %@", vd);
-            }
-            return;
-        }
-        ks_log(@"     未知类型: %@", NSStringFromClass([obj class]));
     } @catch (NSException *e) {
         ks_log(@"  异常: %@", e.reason);
     }
@@ -106,19 +122,11 @@ static void ks_dumpKey(NSString *key) {
         [[NSFileManager defaultManager] removeItemAtPath:
          [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ksdid_log.txt"]
                                                  error:NULL];
-        ks_log(@"===== KSDid v7 =====");
-        ks_log(@"沙盒: %@", NSHomeDirectory());
+        ks_log(@"===== KSDid v8 (解析 CiInfoKey 明文) =====");
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(0, 0), ^{
-            ks_log(@"[IDFV] %@", [[UIDevice currentDevice] identifierForVendor].UUIDString);
-            ks_log(@"[IDFA] %@", [[[NSClassFromString(@"ASIdentifierManager")
-                                    performSelector:@selector(sharedManager)]
-                                   performSelector:@selector(advertisingIdentifier)] UUIDString]);
             ks_dumpKey(@"CiInfoKey_Re_N");
-            // 试其他后缀
-            ks_dumpKey(@"CiInfoKey_Re_1");
-            ks_dumpKey(@"CiInfoKey_Re_2");
             ks_log(@"===== 完成 =====");
         });
     }
