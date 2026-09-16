@@ -1,6 +1,13 @@
-// KSDid v10 —— 全量 hook Keychain API
-// v9 发现：快手没调用 SecItemCopyMatching（hook 装了但没触发）
-// 本版同时 hook CopyMatching / Add / Update / Delete，找出快手读/写 did 的真实路径
+// KSDid v11 —— 自动写入版
+// 思路：插件注入快手后，【主动把 did 写进 MMKV 和 Keychain】
+//      不需要外部杀进程，快手启动时插件先改好，快手读到的就是新值
+//
+// 已确认的 did 存储：
+//   1) MMKV 文件: <容器>/Documents/mmkv/kKSUMMKVStoreKey 等（明文 UUID）
+//   2) Keychain:  CiInfoKey_Re_N（bplist + base64 JSON 里的 cloud_did）
+//
+// 配置: 快手沙盒 Documents/ks_did.txt （一行 UUID）
+// 日志: 快手沙盒 Documents/ksdid_log.txt
 
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
@@ -9,7 +16,7 @@
 
 static NSString *g_customDid = nil;
 static NSString *g_logPath = nil;
-static int g_cm = 0, g_add = 0, g_upd = 0, g_del = 0;
+static int g_writes = 0;
 
 static NSString *ks_logPath(void) {
     if (g_logPath) return g_logPath;
@@ -62,164 +69,164 @@ static NSString *ks_loadCustomDid(void) {
     return nil;
 }
 
-static NSString *ks_queryName(CFDictionaryRef q) {
-    if (!q) return @"(null)";
-    @try {
-        NSDictionary *d = (__bridge NSDictionary *)q;
-        id s = d[(__bridge id)kSecAttrService];
-        id a = d[(__bridge id)kSecAttrAccount];
-        NSMutableString *m = [NSMutableString string];
-        if ([s isKindOfClass:[NSString class]]) [m appendFormat:@"svc=%@", s];
-        if ([a isKindOfClass:[NSString class]]) [m appendFormat:@" acct=%@", a];
-        return m.length ? m : @"(无名称)";
-    } @catch (NSException *e) { return @"(异常)"; }
-}
-
-static NSString *ks_replaceCloudDid(NSString *b64) {
-    if (!b64.length || !g_customDid.length) return nil;
-    NSData *raw = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
-    if (!raw.length) return nil;
-    NSString *json = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
-    if (!json.length || [json rangeOfString:@"cloud_did"].location == NSNotFound) return nil;
+/// 把 data 里所有 UUID 形态的串换成自定义 did
+static NSData *ks_replaceUUIDsInData(NSData *data, int *countOut) {
+    if (!data.length || !g_customDid.length) return nil;
+    NSString *s = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
+    if (!s.length) return nil;
 
     NSRegularExpression *re =
         [NSRegularExpression regularExpressionWithPattern:
-         @"(\"cloud_did\"\\s*:\\s*\")([^\"]*)(\")" options:0 error:NULL];
-    if (![re numberOfMatchesInString:json options:0 range:NSMakeRange(0, json.length)])
-        return nil;
+         @"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+          "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}" options:0 error:NULL];
+    NSArray *ms = [re matchesInString:s options:0 range:NSMakeRange(0, s.length)];
+    if (!ms.count) return nil;
 
-    NSString *newJson = [re stringByReplacingMatchesInString:json options:0
-                                                       range:NSMakeRange(0, json.length)
-                                                withTemplate:
-                       [NSString stringWithFormat:@"$1%@$3", g_customDid]];
-    if ([newJson isEqualToString:json]) return nil;
-    return [[newJson dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+    NSMutableString *out = [NSMutableString stringWithString:s];
+    int n = 0;
+    for (NSInteger i = (NSInteger)ms.count - 1; i >= 0; i--) {
+        NSTextCheckingResult *m = (NSTextCheckingResult *)ms[(NSUInteger)i];
+        NSString *old = [s substringWithRange:m.range];
+        if ([old caseInsensitiveCompare:g_customDid] == NSOrderedSame) continue;
+        [out replaceCharactersInRange:m.range withString:g_customDid];
+        n++;
+    }
+    if (!n) return nil;
+    if (countOut) *countOut = n;
+    return [out dataUsingEncoding:NSISOLatin1StringEncoding];
 }
 
-/// 处理可能含 did 的 bplist，返回新 NSData（nil 表示无需改）
-static NSData *ks_patchPlistData(NSData *data, NSString **logOut) {
-    if (!data.length || data.length > 64 * 1024) return nil;
-    NSError *err = nil;
-    id parsed = [NSPropertyListSerialization propertyListWithData:data
-                                                         options:NSPropertyListMutableContainers
-                                                          format:NULL error:&err];
-    if (!parsed || ![parsed isKindOfClass:[NSDictionary class]]) return nil;
+/// 修改快手沙盒里的 MMKV 文件
+static int ks_patchMMKV(void) {
+    if (!g_customDid.length) return 0;
+    NSString *home = NSHomeDirectory();     // 快手的沙盒
+    NSString *mmkvDir = [home stringByAppendingPathComponent:@"Documents/mmkv"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:mmkvDir isDirectory:&isDir] || !isDir) {
+        ks_log(@"[MMKV] 目录不存在: %@", mmkvDir);
+        return 0;
+    }
+    NSArray *files = [fm contentsOfDirectoryAtPath:mmkvDir error:NULL];
+    ks_log(@"[MMKV] 目录有 %lu 个文件", (unsigned long)files.count);
 
-    NSMutableDictionary *plist = (NSMutableDictionary *)parsed;
-    NSMutableArray *objs = plist[@"$objects"];
-    if (![objs isKindOfClass:[NSMutableArray class]]) return nil;
+    int total = 0, touched = 0;
+    // 优先这几个关键文件
+    NSArray *priority = @[@"kKSUMMKVStoreKey", @"kKSUHeartBeatReportKey",
+                          @"com.kuaishou.KSNewDiskCache.startup",
+                          @"com.kuaishou.ConfigCenter.KSStartupService"];
+    for (NSString *name in priority) {
+        NSString *p = [mmkvDir stringByAppendingPathComponent:name];
+        if (![fm fileExistsAtPath:p]) continue;
 
-    BOOL changed = NO;
-    for (NSUInteger i = 0; i < objs.count; i++) {
-        id o = objs[i];
-        if (![o isKindOfClass:[NSString class]]) continue;
-        NSString *s = (NSString *)o;
-        if (s.length < 20) continue;
+        NSDictionary *attr = [fm attributesOfItemAtPath:p error:NULL];
+        NSNumber *perm = attr[NSFilePosixPermissions];
 
-        NSData *dec = [[NSData alloc] initWithBase64EncodedString:s options:0];
-        if (!dec.length) continue;
-        NSString *t = [[NSString alloc] initWithData:dec encoding:NSUTF8StringEncoding];
-        if (!t.length || [t rangeOfString:@"cloud_did"].location == NSNotFound) continue;
+        NSData *data = [NSData dataWithContentsOfFile:p];
+        if (!data.length || data.length > 8 * 1024 * 1024) continue;
 
-        NSString *nb = ks_replaceCloudDid(s);
-        if (nb.length) {
-            objs[i] = nb;
-            changed = YES;
-            if (logOut) *logOut = t;
+        int n = 0;
+        NSData *newData = ks_replaceUUIDsInData(data, &n);
+        if (!newData) continue;
+
+        if ([newData writeToFile:p atomically:NO]) {
+            if (perm) [fm setAttributes:@{NSFilePosixPermissions: perm}
+                            ofItemAtPath:p error:NULL];
+            touched++; total += n;
+            ks_log(@"[MMKV] ✓ %@ 改 %d 处", name, n);
+        } else {
+            ks_log(@"[MMKV] ✗ %@ 写入失败", name);
         }
     }
-    if (!changed) return nil;
-
-    return [NSPropertyListSerialization dataWithPropertyList:plist
-                                                      format:NSPropertyListBinaryFormat_v1_0
-                                                     options:0 error:NULL];
+    ks_log(@"[MMKV] 共改 %d 文件 %d 处", touched, total);
+    return total;
 }
 
-// ==================== hooks ====================
-
-static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
-
-static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    OSStatus ret = orig_SecItemCopyMatching(query, result);
+/// 修改 Keychain 里的 CiInfoKey_Re_N
+static BOOL ks_patchKeychain(void) {
+    if (!g_customDid.length) return NO;
     @try {
-        g_cm++;
-        if (ret != errSecSuccess || !result || !*result) return ret;
-        NSString *nm = ks_queryName(query);
-        id obj = (__bridge id)*result;
+        NSDictionary *q = @{
+            (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrService: @"CiInfoKey_Re_N",
+            (__bridge id)kSecReturnData: @YES,
+            (__bridge id)kSecReturnAttributes: @YES,
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne
+        };
+        CFTypeRef r = NULL;
+        OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &r);
+        if (st != errSecSuccess || !r) {
+            ks_log(@"[KC] 读取失败 status=%d", (int)st);
+            return NO;
+        }
+        NSDictionary *d = (__bridge_transfer NSDictionary *)r;
+        NSData *data = d[(__bridge id)kSecValueData];
+        if (!data.length) return NO;
 
-        if ([obj isKindOfClass:[NSDictionary class]]) {
-            NSDictionary *d = (NSDictionary *)obj;
-            NSData *data = d[(__bridge id)kSecValueData];
-            NSString *hit = nil;
-            NSData *newData = ks_patchPlistData(data, &hit);
-            if (newData) {
-                NSMutableDictionary *md = [NSMutableDictionary dictionaryWithDictionary:d];
-                md[(__bridge id)kSecValueData] = newData;
-                CFTypeRef old = *result;
-                *result = (__bridge_retained CFTypeRef)md;
-                if (old) CFRelease(old);
-                ks_log(@"[COPY-OK] %@ | %@ → did=%@", nm, hit, g_customDid);
-            }
+        NSError *err = nil;
+        id parsed = [NSPropertyListSerialization propertyListWithData:data
+                                                             options:NSPropertyListMutableContainers
+                                                              format:NULL error:&err];
+        if (!parsed || ![parsed isKindOfClass:[NSDictionary class]]) {
+            ks_log(@"[KC] bplist 解析失败: %@", err.localizedDescription);
+            return NO;
         }
-        // 记录 did 相关查询（便于诊断）
-        if ([nm rangeOfString:@"CiInfo"].location != NSNotFound) {
-            ks_log(@"[COPY-%d] %@", (int)ret, nm);
+        NSMutableDictionary *plist = (NSMutableDictionary *)parsed;
+        NSMutableArray *objs = plist[@"$objects"];
+        if (![objs isKindOfClass:[NSMutableArray class]]) return NO;
+
+        BOOL changed = NO;
+        for (NSUInteger i = 0; i < objs.count; i++) {
+            id o = objs[i];
+            if (![o isKindOfClass:[NSString class]]) continue;
+            NSString *s = (NSString *)o;
+            if (s.length < 20) continue;
+
+            NSData *dec = [[NSData alloc] initWithBase64EncodedString:s options:0];
+            if (!dec.length) continue;
+            NSString *json = [[NSString alloc] initWithData:dec encoding:NSUTF8StringEncoding];
+            if (!json.length || [json rangeOfString:@"cloud_did"].location == NSNotFound) continue;
+
+            NSRegularExpression *re =
+                [NSRegularExpression regularExpressionWithPattern:
+                 @"(\"cloud_did\"\\s*:\\s*\")([^\"]*)(\")" options:0 error:NULL];
+            NSString *nj = [re stringByReplacingMatchesInString:json options:0
+                                                          range:NSMakeRange(0, json.length)
+                                                   withTemplate:
+                            [NSString stringWithFormat:@"$1%@$3", g_customDid]];
+            if ([nj isEqualToString:json]) continue;
+
+            objs[i] = [[nj dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+            changed = YES;
+            ks_log(@"[KC] cloud_did: %@ → %@", json, nj);
         }
-    } @catch (NSException *e) { ks_log(@"[COPY-ERR] %@", e.reason); }
-    return ret;
+        if (!changed) { ks_log(@"[KC] 无需修改"); return NO; }
+
+        NSData *newData = [NSPropertyListSerialization dataWithPropertyList:plist
+                                                                     format:NSPropertyListBinaryFormat_v1_0
+                                                                    options:0 error:NULL];
+        if (!newData.length) return NO;
+
+        NSMutableDictionary *upd = [NSMutableDictionary dictionary];
+        upd[(__bridge id)kSecValueData] = newData;
+        OSStatus st2 = SecItemUpdate((__bridge CFDictionaryRef)q,
+                                     (__bridge CFDictionaryRef)upd);
+        ks_log(@"[KC] SecItemUpdate status=%d", (int)st2);
+        return st2 == errSecSuccess;
+    } @catch (NSException *e) {
+        ks_log(@"[KC] 异常: %@", e.reason);
+        return NO;
+    }
 }
 
-static OSStatus (*orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *);
-
-static OSStatus my_SecItemAdd(CFDictionaryRef attrs, CFTypeRef *result) {
-    @try {
-        g_add++;
-        if (attrs) {
-            NSDictionary *d = (__bridge NSDictionary *)attrs;
-            NSData *data = d[(__bridge id)kSecValueData];
-            if (data.length) {
-                NSString *hit = nil;
-                NSData *nd = ks_patchPlistData(data, &hit);
-                if (nd) {
-                    NSMutableDictionary *md = [NSMutableDictionary dictionaryWithDictionary:d];
-                    md[(__bridge id)kSecValueData] = nd;
-                    ks_log(@"[ADD-OK] %@ | %@ → did=%@", ks_queryName(attrs), hit, g_customDid);
-                    return orig_SecItemAdd((__bridge CFDictionaryRef)md, result);
-                }
-            }
-        }
-    } @catch (NSException *e) { ks_log(@"[ADD-ERR] %@", e.reason); }
-    return orig_SecItemAdd(attrs, result);
-}
-
-static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef, CFDictionaryRef);
-
-static OSStatus my_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attrs) {
-    @try {
-        g_upd++;
-        if (attrs) {
-            NSDictionary *d = (__bridge NSDictionary *)attrs;
-            NSData *data = d[(__bridge id)kSecValueData];
-            if (data.length) {
-                NSString *hit = nil;
-                NSData *nd = ks_patchPlistData(data, &hit);
-                if (nd) {
-                    NSMutableDictionary *md = [NSMutableDictionary dictionaryWithDictionary:d];
-                    md[(__bridge id)kSecValueData] = nd;
-                    ks_log(@"[UPDATE-OK] %@ | %@ → did=%@", ks_queryName(query), hit, g_customDid);
-                    return orig_SecItemUpdate(query, (__bridge CFDictionaryRef)md);
-                }
-            }
-        }
-    } @catch (NSException *e) { ks_log(@"[UPDATE-ERR] %@", e.reason); }
-    return orig_SecItemUpdate(query, attrs);
-}
-
-static OSStatus (*orig_SecItemDelete)(CFDictionaryRef);
-
-static OSStatus my_SecItemDelete(CFDictionaryRef query) {
-    @try { g_del++; } @catch (...) {}
-    return orig_SecItemDelete(query);
+/// 执行一次完整写入
+static void ks_doPatch(const char *why) {
+    if (!g_customDid.length) return;
+    g_writes++;
+    ks_log(@"===== 第 %d 次写入 (触发: %s) =====", g_writes, why);
+    ks_patchMMKV();
+    ks_patchKeychain();
+    ks_log(@"===== 完成 =====");
 }
 
 %ctor {
@@ -228,14 +235,20 @@ static OSStatus my_SecItemDelete(CFDictionaryRef query) {
          [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ksdid_log.txt"]
                                                  error:NULL];
         g_customDid = ks_loadCustomDid();
-        ks_log(@"===== KSDid v10 (全量 Keychain hook) =====");
+        ks_log(@"===== KSDid v11 (自动写入) =====");
+        ks_log(@"沙盒: %@", NSHomeDirectory());
         ks_log(@"自定义 did = %@", g_customDid ?: @"(未配置)");
 
-        MSHookFunction((void *)SecItemCopyMatching, (void *)my_SecItemCopyMatching,
-                       (void **)&orig_SecItemCopyMatching);
-        MSHookFunction((void *)SecItemAdd, (void *)my_SecItemAdd, (void **)&orig_SecItemAdd);
-        MSHookFunction((void *)SecItemUpdate, (void *)my_SecItemUpdate, (void **)&orig_SecItemUpdate);
-        MSHookFunction((void *)SecItemDelete, (void *)my_SecItemDelete, (void **)&orig_SecItemDelete);
-        ks_log(@"4 个 hook 已安装");
+        if (!g_customDid.length) return;
+
+        // 多次触发：快手启动是异步的，MMKV 可能稍后才建好
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(0, 0), ^{ ks_doPatch("启动+0.5s"); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(0, 0), ^{ ks_doPatch("启动+2s"); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(0, 0), ^{ ks_doPatch("启动+5s"); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(0, 0), ^{ ks_doPatch("启动+10s"); });
     }
 }
