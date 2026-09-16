@@ -19,8 +19,81 @@
 #import <dlfcn.h>
 #import <stdlib.h>
 #import <unistd.h>
+#import <mach/mach.h>
+
+// 不 include <libproc.h> / <xpc/xpc.h> —— 它们不在公开 SDK 里，
+// 改用 dlsym 动态取符号 + 自己声明所需常量（值来自 Darwin 头文件）
+#ifndef PROC_ALL_PIDS
+#define PROC_ALL_PIDS 1
+#endif
+#ifndef PROC_PIDPATHINFO_MAXSIZE
+#define PROC_PIDPATHINFO_MAXSIZE (4 * 1024)
+#endif
 
 extern char **environ;
+
+#pragma mark - ========== 进程枚举 / 终止（多策略）==========
+
+// libproc 的函数在 dyld 共享缓存里，用 dlsym 拿，避免链接期依赖
+typedef int (*proc_listpids_t)(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
+typedef int (*proc_pidpath_t)(int pid, void *buffer, uint32_t buffersize);
+
+static proc_listpids_t  g_proc_listpids = NULL;
+static proc_pidpath_t   g_proc_pidpath  = NULL;
+static BOOL             g_libprocTried  = NO;
+
+/// 懒加载 libproc 符号
+static void ks_load_libproc(void) {
+    if (g_libprocTried) return;
+    g_libprocTried = YES;
+    // 优先主程序符号表（libproc 在 dyld 共享缓存里，通常已加载）
+    void *h = dlopen(NULL, RTLD_LAZY);
+    if (h) {
+        g_proc_listpids = (proc_listpids_t)dlsym(h, "proc_listpids");
+        g_proc_pidpath  = (proc_pidpath_t)dlsym(h, "proc_pidpath");
+    }
+    if (!g_proc_listpids || !g_proc_pidpath) {
+        void *h2 = dlopen("/usr/lib/libproc.dylib", RTLD_LAZY);
+        if (!h2) h2 = dlopen("/usr/lib/system/libsystem_kernel.dylib", RTLD_LAZY);
+        if (h2) {
+            if (!g_proc_listpids) g_proc_listpids = (proc_listpids_t)dlsym(h2, "proc_listpids");
+            if (!g_proc_pidpath)  g_proc_pidpath  = (proc_pidpath_t)dlsym(h2, "proc_pidpath");
+        }
+    }
+}
+
+/// 用 libproc 枚举所有进程，找出可执行路径含指定关键词的进程
+/// ★ 这是 Darwin 原生 API，不 spawn 任何外部程序，
+///   因此在 RootHide 沙盒下也能工作（posix_spawn 会被拦）。
+static pid_t ks_find_pid_by_path_keyword(NSArray<NSString *> *keywords) {
+    ks_load_libproc();
+    if (!g_proc_listpids || !g_proc_pidpath) return 0;
+
+    int bytes = g_proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
+    if (bytes <= 0) return 0;
+    int cap = bytes / sizeof(pid_t) + 64;
+    pid_t *pids = malloc(cap * sizeof(pid_t));
+    if (!pids) return 0;
+    bytes = g_proc_listpids(PROC_ALL_PIDS, 0, pids, cap * sizeof(pid_t));
+    if (bytes <= 0) { free(pids); return 0; }
+    int n = bytes / sizeof(pid_t);
+
+    pid_t found = 0;
+    for (int i = 0; i < n; i++) {
+        pid_t p = pids[i];
+        if (p <= 0) continue;
+        char buf[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (g_proc_pidpath(p, buf, sizeof(buf)) <= 0) continue;
+        NSString *path = [NSString stringWithUTF8String:buf];
+        if (!path.length) continue;
+        for (NSString *kw in keywords) {
+            if ([path containsString:kw]) { found = p; break; }
+        }
+        if (found) break;
+    }
+    free(pids);
+    return found;
+}
 
 #pragma mark - ========== 日志 ==========
 
@@ -713,6 +786,23 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 /// ★ 实测：iOS 上 /proc 不存在，ps/pgrep 也没装，
 ///   唯一可用的进程枚举方式就是 sysctl(KERN_PROC_ALL) + proc_pidpath。
 + (pid_t)pidFromSysctlForName:(NSString *)procName {
+    // ★★ 第一优先：libproc（Darwin 原生 API，不 spawn 外部程序）
+    //    实测 posix_spawn 在 RootHide 下完全失效，但 dlsym 调用系统库可以。
+    //    用 proc_pidpath 拿到的【完整可执行路径】比 p_comm 准确得多 ——
+    //    快手可执行路径形如：
+    //      /var/containers/Bundle/Application/<UUID>/com_kwai_gif.app/com_kwai_gif
+    ks_load_libproc();
+    if (g_proc_listpids && g_proc_pidpath) {
+        pid_t lp = ks_find_pid_by_path_keyword(@[@"com_kwai_gif", @"com.kuaishou.nebula"]);
+        if (lp > 0) {
+            [KSLog add:@"  libproc 命中 → PID=%d", (int)lp];
+            return lp;
+        }
+        [KSLog add:@"  libproc 可用但没找到快手"];
+    } else {
+        [KSLog add:@"  libproc 不可用，回退 sysctl"];
+    }
+
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
     size_t len = 0;
 
