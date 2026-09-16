@@ -19,7 +19,7 @@
 static NSString *g_targetDid = nil;      // 想改成什么
 static NSString *g_observedDids = nil;   // 从响应里学到的 did 列表
 static NSString *g_logPath = nil;
-static int g_reqFixed = 0, g_respFixed = 0, g_localFixed = 0;
+static int g_reqFixed = 0, g_respFixed = 0;
 
 static NSString *ks_logPath(void) {
     if (g_logPath) return g_logPath;
