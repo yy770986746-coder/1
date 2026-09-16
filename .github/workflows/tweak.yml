@@ -1,0 +1,59 @@
+name: Build KSDid Tweak
+
+on:
+  push:
+    paths:
+      - 'kstweak/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos dependencies
+        run: brew install ldid dpkg xz
+
+      - name: Install Theos
+        run: |
+          export THEOS="$HOME/theos"
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Link iOS SDK
+        run: |
+          mkdir -p "$THEOS/sdks"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          ln -sf "$SDK" "$THEOS/sdks/iPhoneOS.sdk"
+          echo "SDK=$SDK"
+          ls -la "$THEOS/sdks/"
+
+      - name: Build tweak
+        working-directory: kstweak
+        run: |
+          set -e
+          make clean 2>/dev/null || true
+          make package FINALPACKAGE=1 2>&1 | tail -40
+          echo "=== 产物 ==="
+          ls -la packages/ || true
+
+      - name: Verify deb
+        working-directory: kstweak
+        run: |
+          set -e
+          DEB=$(ls packages/*.deb 2>/dev/null | head -1)
+          if [ -z "$DEB" ]; then echo "没有产出 deb"; exit 1; fi
+          echo "deb: $DEB"
+          dpkg-deb -c "$DEB"
+          echo "=== 检查 dylib ==="
+          dpkg-deb -x "$DEB" /tmp/x
+          find /tmp/x -name '*.dylib' -exec file {} \;
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: ks-did-tweak
+          path: kstweak/packages/*.deb
+          if-no-files-found: error
