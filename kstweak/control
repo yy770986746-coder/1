@@ -1,7 +1,7 @@
 Package: com.momo.ksdid
 Name: KSDid
 Version: 1.0.0
-Architecture: iphoneos-arm64
+Architecture: iphoneos-arm64e
 Description: 快手自定义 did 插件 —— 指定 UUID 覆盖快手设备标识
 Maintainer: momo
 Author: momo
