@@ -18,7 +18,8 @@
 		<string>NR2KD6K4TL.com.kwai.video</string>
 		<string>com.kuaishou.gifshow</string>
 		<string>NR2KD6K4TL.com.kuaishou.gifshow</string>
-		<string>$(AppIdentifierPrefix)com.jiangjia.gif</string>
 	</array>
+	<key>application-identifier</key>
+	<string>NR2KD6K4TL.com.jiangjia.gif</string>
 </dict>
 </plist>

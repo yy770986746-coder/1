@@ -18,18 +18,13 @@ static NSString *g_logPath = nil;
 
 static NSString *ks_logPath(void) {
     if (g_logPath) return g_logPath;
+    // 直接构造，不做写入测试（早期阶段 fileExists 可能异常）
     NSString *home = NSHomeDirectory();
-    NSArray *cands = @[
-        [home stringByAppendingPathComponent:@"Documents/ksdid_log.txt"],
-        @"/var/mobile/Documents/ksdid_log.txt"
-    ];
-    for (NSString *p in cands) {
-        if ([@"init" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL]) {
-            g_logPath = p;
-            return p;
-        }
+    if (home.length) {
+        g_logPath = [home stringByAppendingPathComponent:@"Documents/ksdid_log.txt"];
+    } else {
+        g_logPath = @"/var/mobile/Documents/ksdid_log.txt";
     }
-    g_logPath = cands.firstObject;
     return g_logPath;
 }
 
@@ -308,27 +303,45 @@ static void ks_doPatch(const char *why) {
 
 %ctor {
     @autoreleasepool {
+        // ★ 极早期什么都不做，只记下目标 did
+        // （NSHomeDirectory / NSFileManager 在 %ctor 阶段可能异常）
         g_customDid = ks_loadCustomDid();
-        ks_log(@"");
-        ks_log(@"########## KSDid v13 ##########");
-        ks_log(@"目标 did = %@", g_customDid ?: @"(未配置)");
-        ks_log(@"sha1(empty) = %@", ks_sha1Empty());
-        if (!g_customDid.length) return;
 
-        // ★ 枚举 Keychain（在启动早期做，看快手还没写之前的原始值）
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+        // 全部逻辑推迟到 1 秒后执行
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(0, 0), ^{
-            ks_dumpKeychain();
+            @try {
+                ks_log(@"");
+                ks_log(@"########## KSDid v13 ##########");
+                ks_log(@"目标 did = %@", g_customDid ?: @"(未配置)");
+                ks_log(@"sha1(empty) = %@", ks_sha1Empty());
+
+                // ① 先枚举（看原始状态）
+                ks_dumpKeychain();
+
+                // ② 再改
+                ks_doPatch("+0.8s");
+
+                // ③ 二次枚举（看改后状态）
+                ks_dumpKeychain();
+            } @catch (NSException *e) {
+                ks_log(@"!!! 异常: %@ / %@", e.name, e.reason);
+            }
         });
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                       dispatch_get_global_queue(0, 0), ^{ ks_doPatch("+1s"); });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                       dispatch_get_global_queue(0, 0), ^{ ks_doPatch("+3s"); });
+                       dispatch_get_global_queue(0, 0), ^{
+            @try {
+                ks_doPatch("+3s");
+            } @catch (NSException *e) {}
+        });
+
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(0, 0), ^{
-            ks_doPatch("+8s");
-            ks_dumpKeychain();
+            @try {
+                ks_doPatch("+8s");
+                ks_dumpKeychain();
+            } @catch (NSException *e) {}
         });
     }
 }
