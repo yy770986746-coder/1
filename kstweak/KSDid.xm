@@ -74,7 +74,7 @@ static NSString *ks_dataDesc(NSData *d) {
     NSString *tag = (r.location != NSNotFound) ? @"bplist" : @"二进制";
 
     NSMutableString *hex = [NSMutableString string];
-    const uint8_t *b = d.bytes;
+    const uint8_t *b = (const uint8_t *)d.bytes;
     NSUInteger n = MIN((NSUInteger)80, d.length);
     for (NSUInteger i = 0; i < n; i++) [hex appendFormat:@"%02x", b[i]];
 
@@ -105,8 +105,10 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
 
         NSDictionary *q = (__bridge NSDictionary *)query;
         id svc  = q[(__bridge id)kSecAttrService];
-        id acct = q[(__bridge id)kSecAttrAccount];
+        id acctRaw = q[(__bridge id)kSecAttrAccount];
         NSString *svcS = [svc isKindOfClass:[NSString class]] ? svc : @"";
+        // acct 在快手这版里与 svc 相同，仅作兜底匹配
+        NSString *acctS = [acctRaw isKindOfClass:[NSString class]] ? acctRaw : @"";
 
         // 只关心这些候选键
         BOOL interesting = NO;
@@ -114,6 +116,9 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
                               @"CiInfo", @"did", @"Did", @"DID", @"device",
                               @"EAccount", @"IDFA", @"idfa", @"DFP"]) {
             if (svcS.length && [svcS rangeOfString:k].location != NSNotFound) {
+                interesting = YES; break;
+            }
+            if (acctS.length && [acctS rangeOfString:k].location != NSNotFound) {
                 interesting = YES; break;
             }
         }
