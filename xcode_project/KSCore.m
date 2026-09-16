@@ -1767,12 +1767,25 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 
     if (hits == 0) return 0;
 
+    // ★ 写回策略：先直接覆盖写，失败再用原子写
+    //   实测 MMKV 文件权限是 -rwx------，NSDataWritingAtomic 需要
+    //   在同目录建临时文件再 rename，某些越狱沙盒下会失败；
+    //   直接 writeToFile: 反而更可靠。
     NSError *e = nil;
-    if (![out writeToFile:path options:NSDataWritingAtomic error:&e]) {
+    BOOL ok = [out writeToFile:path options:0 error:&e];
+    if (!ok) {
+        e = nil;
+        ok = [out writeToFile:path options:NSDataWritingAtomic error:&e];
+    }
+    if (!ok) {
         [KSLog add:@"      ✗ 写入失败 %@: %@", [path lastPathComponent],
          e.localizedDescription ?: @"未知"];
         return 0;
     }
+    // 保持原权限（MMKV 是 0700）
+    [[NSFileManager defaultManager]
+     setAttributes:@{NSFilePosixPermissions: @(0700)}
+     ofItemAtPath:path error:NULL];
     return hits;
 }
 
@@ -1845,9 +1858,11 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     NSString *dir = [t.dataContainer stringByAppendingPathComponent:@"Documents/mmkv"];
     BOOL isDir = NO;
     if (![fm fileExistsAtPath:dir isDirectory:&isDir] || !isDir) {
-        [KSLog add:@"      ⚠ mmkv 目录不存在"];
+        [KSLog add:@"      ⚠ mmkv 目录不存在: %@", dir];
         return 0;
     }
+    NSArray *probe = [fm contentsOfDirectoryAtPath:dir error:NULL];
+    [KSLog add:@"      mmkv 目录有 %lu 个文件", (unsigned long)probe.count];
 
     // ★ 优先处理已知含 did 的文件
     //   注意：用 replaceAllUUIDInFile（自动识别 UUID），不依赖 oldDID ——
@@ -1873,8 +1888,13 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         [done addObject:name];
         NSUInteger n = [self replaceAllUUIDInFile:p to:newDID mustContain:nil];
         if (n) {
-            [KSLog add:@"      %@ → 替换 %lu 处", name, (unsigned long)n];
+            [KSLog add:@"      ✓ %@ → 替换 %lu 处", name, (unsigned long)n];
             total += n;
+        } else {
+            // 输出诊断，便于定位是"没找到 UUID"还是"写不进去"
+            NSData *d = [NSData dataWithContentsOfFile:p];
+            [KSLog add:@"      · %@ 无可替换（可读=%lu 字节）", name,
+             (unsigned long)d.length];
         }
     }
 
