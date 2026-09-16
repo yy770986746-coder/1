@@ -295,6 +295,46 @@ static NSLock *gLock = nil;
     return info[@"CFBundleIdentifier"];
 }
 
+/// 确保 target 的路径是最新有效的
+///
+/// ★ 实测坑（RootHide 无根越狱）：
+///   /var 是个【相对符号链接】链：/var -> private/var -> /rootfs/var/.../.jbroot-XXXXXXXX/var
+///   每次 userspace 重启后 .jbroot-XXXXXXXX 后缀都可能变，
+///   于是 App 里【缓存下来的容器路径会失效】（表现为"文件存在=否"）。
+///   所以任何读写操作前都要校验一次，失效就地重新解析。
++ (void)ensurePathsValid:(KSTarget *)t {
+    if (!t) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // 路径还有效 → 直接返回
+    if (t.prefsPath.length && [fm fileExistsAtPath:t.prefsPath]) return;
+
+    [KSLog add:@"[路径自愈] 缓存路径已失效，重新探测容器..."];
+    NSString *bid = t.bundleID.length ? t.bundleID : KS_BID_MAIN;
+    NSString *c = [self containerForBundleID:bid];
+    if (!c) c = [self containerForBundleID:KS_BID_MAIN];
+    if (!c) {
+        [KSLog add:@"            ✗ 重新探测也失败"];
+        return;
+    }
+    t.dataContainer = c;
+    t.prefsPath = [self prefsPathIn:c bundleID:bid];
+    [KSLog add:@"            ✓ 新容器: %@", c];
+    [KSLog add:@"            ✓ 新 plist: %@", t.prefsPath];
+}
+
+/// 容器根路径的备用形式（/var 与 /private/var 都试）
++ (NSArray<NSString *> *)pathVariants:(NSString *)path {
+    if (!path.length) return @[];
+    NSMutableArray *out = [NSMutableArray arrayWithObject:path];
+    if ([path hasPrefix:@"/private/var/"]) {
+        [out addObject:[path substringFromIndex:8]];        // 去掉 /private
+    } else if ([path hasPrefix:@"/var/"]) {
+        [out addObject:[@"/private" stringByAppendingString:path]];
+    }
+    return out;
+}
+
 /// 容器归属：读容器根下的元数据 plist 拿 MCMMetadataIdentifier
 + (NSString *)identifierOfContainer:(NSString *)container {
     NSString *meta = [container stringByAppendingPathComponent:
@@ -535,7 +575,9 @@ static NSLock *gLock = nil;
 + (NSString *)currentDID:(KSTarget *)t;
 + (BOOL)changeDID:(NSString *)did target:(KSTarget *)t;
 + (NSUInteger)replaceInFile:(NSString *)path old:(NSString *)oldDID new:(NSString *)newDID;
++ (NSUInteger)replaceAllUUIDInFile:(NSString *)path to:(NSString *)newDID mustContain:(NSString *)mustContain;
 + (NSUInteger)changeDIDInMMKV:(NSString *)oldDID to:(NSString *)newDID target:(KSTarget *)t;
++ (NSArray<NSString *> *)pathVariants:(NSString *)path;
 @end
 
 @implementation KSInjector
@@ -694,6 +736,7 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     [KSLog add:@"  sysctl 枚举到 %d 个进程", count];
     pid_t found = 0;
 
+    NSMutableArray *sample = [NSMutableArray array];
     for (int i = 0; i < count; i++) {
         pid_t p = buf[i].kp_proc.p_pid;
         if (p <= 0) continue;
@@ -701,16 +744,35 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         const char *cname = buf[i].kp_proc.p_comm;
         if (cname == NULL) continue;
         NSString *comm = [NSString stringWithUTF8String:cname];
-        if (comm == nil) continue;
-        if ([comm isEqualToString:procName]) {
+        if (comm == nil || !comm.length) continue;
+
+        // ★ 精确匹配 + 模糊匹配
+        //   实测：进程名有时不是 "com_kwai_gif"，也可能是
+        //   "com_kwai_gif.xxx"（扩展）或带前缀的形式，故加 contains 兜底
+        BOOL hit = [comm isEqualToString:procName];
+        if (!hit && procName.length >= 6) {
+            hit = [comm containsString:procName] || [procName containsString:comm];
+        }
+        if (hit) {
             found = p;
             [KSLog add:@"  sysctl 命中 %@ → PID=%d", comm, (int)p];
             break;
+        }
+        // 收集可能相关的进程名，便于排查
+        if (sample.count < 40 &&
+            ([comm containsString:@"kwai"] || [comm containsString:@"gif"] ||
+             [comm containsString:@"ks"] || [comm containsString:@"Kwai"])) {
+            [sample addObject:[NSString stringWithFormat:@"%d:%@", (int)p, comm]];
         }
     }
     free(buf);
     if (!found) {
         [KSLog add:@"  sysctl 里没有名为 %@ 的进程", procName];
+        if (sample.count) {
+            [KSLog add:@"  疑似相关进程: %@", [sample componentsJoinedByString:@", "]];
+        } else {
+            [KSLog add:@"  （没有任何名字含 kwai/gif 的进程）"];
+        }
     }
     return found;
 }
@@ -877,6 +939,7 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 }
 
 + (BOOL)writeOnly:(KSFive *)five target:(KSTarget *)t {
+    [KSTarget ensurePathsValid:t];
     // 沙盒没定位到就现场再试一次（可能刚打开快手才建容器）
     if (!t.dataContainer) {
         [KSLog add:@"沙盒未定位，重新探测..."];
@@ -1229,6 +1292,7 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 }
 
 + (KSFive *)readCurrent:(KSTarget *)t {
+    [KSTarget ensurePathsValid:t];
     if (!t.prefsPath) {
         [KSLog add:@"  ✗ prefsPath 为空"];
         return nil;
@@ -1622,6 +1686,97 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 }
 
 // ==================================================================
+
+/// 把文件里【所有 UUID 形态的字符串】替换成 newDID（等长替换）
+///
+/// ★ 为什么需要这个：读取旧 did 依赖 plist 路径有效，
+///   而 RootHide 下路径会因 jbroot 变化而失效，导致 oldDID 为空、
+///   MMKV 替换被整个跳过（实测症状：明文文件改了、MMKV 没改）。
+///   这里不依赖 oldDID —— 直接把文件里所有形如 UUID 的串都换成新 did。
+///   风险很低：这些文件里的 UUID 本来就是 did 及其副本。
+///
+/// @param onlyIfContains 若不为空，则文件里必须含这个串才处理（用于限定目标文件）
+/// @return 替换次数
++ (NSUInteger)replaceAllUUIDInFile:(NSString *)path
+                                to:(NSString *)newDID
+                     mustContain:(NSString *)mustContain {
+    if (!path.length || !newDID.length) return 0;
+    if (newDID.length != 36) return 0;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path]) return 0;
+    NSDictionary *attr = [fm attributesOfItemAtPath:path error:NULL];
+    if ([attr fileSize] == 0 || [attr fileSize] > 16 * 1024 * 1024) return 0;
+
+    NSMutableData *data = [NSMutableData dataWithContentsOfFile:path];
+    if (!data.length) return 0;
+
+    // 若限定必须含某串，先检查
+    if (mustContain.length) {
+        NSData *probe = [mustContain dataUsingEncoding:NSASCIIStringEncoding];
+        if (!probe.length) return 0;
+        NSRange r = [data rangeOfData:probe
+                              options:0
+                                range:NSMakeRange(0, data.length)];
+        if (r.location == NSNotFound) return 0;
+    }
+
+    NSData *newData = [newDID dataUsingEncoding:NSASCIIStringEncoding];
+    if (newData.length != 36) return 0;
+
+    const uint8_t *bytes = data.bytes;
+    NSUInteger len = data.length;
+    NSUInteger i = 0, hits = 0;
+    NSMutableData *out = [NSMutableData dataWithCapacity:len];
+
+    // UUID 形态：8-4-4-4-12，共 36 字符，由 hex 与 '-' 组成
+    while (i < len) {
+        BOOL matched = NO;
+        if (i + 36 <= len) {
+            BOOL ok = YES;
+            for (NSUInteger k = 0; k < 36; k++) {
+                uint8_t ch = bytes[i + k];
+                if (k == 8 || k == 13 || k == 18 || k == 23) {
+                    if (ch != '-') { ok = NO; break; }
+                } else {
+                    BOOL isHex = (ch >= '0' && ch <= '9') ||
+                                 (ch >= 'a' && ch <= 'f') ||
+                                 (ch >= 'A' && ch <= 'F');
+                    if (!isHex) { ok = NO; break; }
+                }
+            }
+            if (ok) {
+                // 已经就是新值 → 也计入（表示无需改）
+                NSRange cur = NSMakeRange(i, 36);
+                NSData *sub = [data subdataWithRange:cur];
+                if (![sub isEqualToData:newData]) {
+                    [out appendData:newData];
+                    hits++;
+                } else {
+                    [out appendData:sub];
+                }
+                i += 36;
+                matched = YES;
+            }
+        }
+        if (!matched) {
+            [out appendBytes:&bytes[i] length:1];
+            i++;
+        }
+    }
+
+    if (hits == 0) return 0;
+
+    NSError *e = nil;
+    if (![out writeToFile:path options:NSDataWritingAtomic error:&e]) {
+        [KSLog add:@"      ✗ 写入失败 %@: %@", [path lastPathComponent],
+         e.localizedDescription ?: @"未知"];
+        return 0;
+    }
+    return hits;
+}
+
+// ==================================================================
 // did 的 MMKV 存储处理
 //
 // ★ 实测（真机 2026-09）：
@@ -1643,8 +1798,7 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 /// 返回替换次数
 + (NSUInteger)replaceInFile:(NSString *)path
                         old:(NSString *)oldDID
-                        new:(NSString *)newDID {
-    if (!path.length || !oldDID.length || !newDID.length) return 0;
+                        new:(NSString *)newDID {    if (!path.length || !oldDID.length || !newDID.length) return 0;
     if (oldDID.length != newDID.length) return 0;   // 必须等长
 
     NSData *data = [NSData dataWithContentsOfFile:path];
@@ -1682,9 +1836,11 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 }
 
 /// 修改 MMKV 目录下所有含 did 的文件
+/// oldDID 保留参数位（不再使用，改用「自动识别 UUID」策略）
 + (NSUInteger)changeDIDInMMKV:(NSString *)oldDID
                            to:(NSString *)newDID
                        target:(KSTarget *)t {
+    (void)oldDID;   // 有意不使用
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *dir = [t.dataContainer stringByAppendingPathComponent:@"Documents/mmkv"];
     BOOL isDir = NO;
@@ -1693,13 +1849,19 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         return 0;
     }
 
-    // 优先处理已知含 did 的文件，再扫全目录兜底
+    // ★ 优先处理已知含 did 的文件
+    //   注意：用 replaceAllUUIDInFile（自动识别 UUID），不依赖 oldDID ——
+    //   实测 oldDID 因路径失效读不到时，旧逻辑会整个跳过 MMKV，导致
+    //   "明文文件改了、MMKV 没改、快手界面 did 不变"。
     NSArray *priority = @[
         @"kKSUMMKVStoreKey",
-        @"com.kuaishou.ConfigCenter.KSStartupService",
-        @"kKSUHeartBeatReportKey",
-        @"com.kuaishou.KSNewDiskCache.startup",
         @"kKSUMMKVStoreKey.crc",
+        @"kKSUHeartBeatReportKey",
+        @"kKSUHeartBeatReportKey.crc",
+        @"com.kuaishou.KSNewDiskCache.startup",
+        @"com.kuaishou.KSNewDiskCache.startup.crc",
+        @"com.kuaishou.ConfigCenter.KSStartupService",
+        @"com.kuaishou.ConfigCenter.KSStartupService.crc",
     ];
 
     NSUInteger total = 0;
@@ -1709,7 +1871,7 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         NSString *p = [dir stringByAppendingPathComponent:name];
         if (![fm fileExistsAtPath:p]) continue;
         [done addObject:name];
-        NSUInteger n = [self replaceInFile:p old:oldDID new:newDID];
+        NSUInteger n = [self replaceAllUUIDInFile:p to:newDID mustContain:nil];
         if (n) {
             [KSLog add:@"      %@ → 替换 %lu 处", name, (unsigned long)n];
             total += n;
@@ -1728,7 +1890,7 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         NSDictionary *attr = [fm attributesOfItemAtPath:p error:NULL];
         if ([attr fileSize] > 8 * 1024 * 1024 || [attr fileSize] == 0) continue;
 
-        NSUInteger n = [self replaceInFile:p old:oldDID new:newDID];
+        NSUInteger n = [self replaceAllUUIDInFile:p to:newDID mustContain:nil];
         if (n) {
             [KSLog add:@"      %@ → 替换 %lu 处", name, (unsigned long)n];
             total += n;
@@ -1739,6 +1901,7 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 
 /// 只读：取出当前 did
 + (NSString *)currentDID:(KSTarget *)t {
+    [KSTarget ensurePathsValid:t];
     if (!t.prefsPath) return nil;
     NSDictionary *d = [self loadPlistAt:t.prefsPath];
     if (!d) return nil;
@@ -1768,9 +1931,17 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         return NO;
     }
 
+    // ★ 路径自愈：RootHide 下 /var 是相对符号链接链，
+    //   每次 userspace 重启 .jbroot-XXXX 后缀都可能变，缓存的路径会失效。
+    [KSTarget ensurePathsValid:t];
+    if (!t.prefsPath || ![t.dataContainer length]) {
+        [KSLog add:@"✗ 容器路径不可用，无法继续"];
+        return NO;
+    }
+
     NSString *oldDID = [self currentDID:t];
     [KSLog add:@"===== 修改 did ====="];
-    [KSLog add:@"  旧: %@", oldDID ?: @"(无)"];
+    [KSLog add:@"  旧: %@", oldDID ?: @"(读不到，将直接按 UUID 形态替换)"];
     [KSLog add:@"  新: %@", did];
 
     // ---- 1) 停快手（必须确认退出，否则会被它写回）----
@@ -1779,17 +1950,14 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     [KSLog add:@"      %@", killed ? @"✓ 已退出" : @"⚠ 未能确认退出，可能失败"];
 
     // ---- 2) ★ 改 MMKV（快手界面显示的就是这里的值，最关键）----
+    //   注意：不依赖 oldDID —— 自动识别文件里所有 UUID 形态的串并替换。
+    //   之前依赖 oldDID，路径失效时 oldDID 为空会整个跳过这一步。
     [KSLog add:@"[2/5] 修改 MMKV 存储..."];
-    NSUInteger mmkvHits = 0;
-    if (oldDID.length && ![oldDID isEqualToString:did]) {
-        mmkvHits = [self changeDIDInMMKV:oldDID to:did target:t];
-        if (mmkvHits) {
-            [KSLog add:@"      ✓ MMKV 共替换 %lu 处", (unsigned long)mmkvHits];
-        } else {
-            [KSLog add:@"      ⚠ MMKV 里没找到旧 did（可能已改过）"];
-        }
-    } else if (!oldDID.length) {
-        [KSLog add:@"      ⚠ 读不到旧 did，跳过 MMKV 替换"];
+    NSUInteger mmkvHits = [self changeDIDInMMKV:(oldDID ?: @"") to:did target:t];
+    if (mmkvHits) {
+        [KSLog add:@"      ✓ MMKV 共替换 %lu 处", (unsigned long)mmkvHits];
+    } else {
+        [KSLog add:@"      ⚠ MMKV 里没有需要替换的 UUID（可能已是新值）"];
     }
 
     // ---- 3) 改 plist ----
@@ -2001,6 +2169,7 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 }
 
 + (BOOL)wipeAllData:(KSTarget *)t {
+    [KSTarget ensurePathsValid:t];
     if (!t.dataContainer) {
         [KSLog add:@"✗ 未定位到容器"];
         return NO;

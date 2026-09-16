@@ -77,6 +77,8 @@
 + (instancetype)detect;
 /// 指定 bundleID
 + (instancetype)forBundleID:(NSString *)bid;
+/// 容器路径缓存失效时重新探测（RootHide 下 /var 符号链接链会变）
++ (void)ensurePathsValid:(KSTarget *)t;
 /// 是否已安装
 + (BOOL)isInstalled:(NSString *)bid;
 /// 本进程是否有 platform-application 权限
