@@ -83,7 +83,8 @@ static NSString *ks_replaceUUIDs(NSString *src, NSString *newDid) {
     if (!ms.count) return src;
     NSMutableString *out = [NSMutableString stringWithString:src];
     for (NSInteger i = (NSInteger)ms.count - 1; i >= 0; i--) {
-        [out replaceCharactersInRange:ms[(NSUInteger)i].range withString:newDid];
+        NSTextCheckingResult *r = (NSTextCheckingResult *)ms[(NSUInteger)i];
+        [out replaceCharactersInRange:r.range withString:newDid];
     }
     return out;
 }
