@@ -41,6 +41,8 @@
 - (void)doPaste;
 - (void)doCopyLog;
 - (void)doClearLog;
+- (void)runChangeDID:(NSString *)did;
+- (void)doChangeDID;
 - (void)alert:(NSString *)msg;
 - (UIButton *)mkButton:(NSString *)title color:(UIColor *)color;
 - (void)setBusy:(BOOL)busy;
@@ -162,6 +164,15 @@
     self.btnWipe = [self mkButton:@"清空数据" color:[UIColor systemRedColor]];
     self.btnWipe.frame = CGRectMake(12 + 2 * (bw + 6), y, bw, 38);
     [self.btnWipe addTarget:self action:@selector(doWipe) forControlEvents:UIControlEventTouchUpInside];
+    y += 46;
+
+    // ---- 功能行 2：只改 did ----
+    UIButton *bDid = [self mkButton:@"改  D I D（只换设备标识）"
+                              color:[UIColor systemOrangeColor]];
+    bDid.frame = CGRectMake(12, y, W - 24, 38);
+    bDid.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    [bDid addTarget:self action:@selector(doChangeDID)
+   forControlEvents:UIControlEventTouchUpInside];
     y += 46;
 
     // ---- 诊断 ----
@@ -387,9 +398,21 @@
 - (void)doLogin {
     if (self.busy) return;
 
+    NSString *raw = [self.input.text
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    // ★ 只输入一个 UUID → 走「改 did」流程
+    //   判据：整段文本就是一个标准 UUID（不含 ---- 分隔符）
+    if (raw.length && ![raw containsString:@"----"] &&
+        [KSInjector isUUID:raw]) {
+        [self runChangeDID:raw];
+        return;
+    }
+
     KSFive *f = [KSFive fromText:self.input.text];
     if (!f) {
-        [self alert:@"请先粘贴五参\n\n格式：\ntoken----salt----did----egid----api_st"];
+        [self alert:@"请先粘贴五参\n\n格式：\ntoken----salt----did----egid----api_st\n\n"
+                     @"或者只填一个 UUID，点此按钮即可单独修改 did"];
         return;
     }
 
@@ -417,6 +440,88 @@
     }
 
     [self runLogin:f];
+}
+
+/// 独立的「改 did」按钮：读输入框里的 UUID 或弹框让用户输入
+- (void)doChangeDID {
+    if (self.busy) return;
+    if (!self.target) {
+        [self alert:@"没检测到快手\n\n点「诊断」按钮看详细结果"];
+        return;
+    }
+
+    NSString *raw = [self.input.text
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    // 输入框里已经是一个合法 UUID → 直接确认执行
+    if (raw.length && ![raw containsString:@"----"] && [KSInjector isUUID:raw]) {
+        [self runChangeDID:raw];
+        return;
+    }
+
+    // 否则弹输入框
+    __weak typeof(self) weakSelf = self;
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"修改 did"
+                         message:@"输入新的 did（标准 UUID 格式）\n\n"
+                                  "例：4C96E59A-0F12-47E8-B56B-FFB036C694CB\n\n"
+                                  "只会修改设备标识，不动 token/salt 等参数"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx";
+        tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消"
+                                          style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"下一步"
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        NSString *v = [a.textFields.firstObject.text
+            stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (![KSInjector isUUID:v]) {
+            [weakSelf alert:@"格式不对，必须是标准 UUID\n\n"
+                             "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"];
+            return;
+        }
+        [weakSelf runChangeDID:v];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)runChangeDID:(NSString *)did {
+    if (!self.target) {
+        [self alert:@"没检测到快手\n\n点「诊断」按钮看详细结果"];
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"修改 did"
+                         message:[NSString stringWithFormat:
+                                  @"将把快手的设备标识改为：\n\n%@\n\n"
+                                   "(不会改动 token、salt 等其他参数)", did]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消"
+                                          style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"确定修改"
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        [weakSelf setBusy:YES];
+        [KSLog clear];
+        [self refreshLog];
+        dispatch_async(dispatch_get_global_queue(0, 0), ^{
+            BOOL ok = [KSInjector changeDID:did target:weakSelf.target];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf setBusy:NO];
+                [weakSelf refreshLog];
+                [weakSelf alert:ok ? @"✓ did 修改完成\n\n快手已重新打开"
+                                  : @"✗ did 修改失败，请看下方日志"];
+            });
+        });
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)runLogin:(KSFive *)f {

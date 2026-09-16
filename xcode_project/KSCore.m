@@ -531,6 +531,11 @@ static NSLock *gLock = nil;
 + (NSString *)egidFromContainerScan;
 + (NSString *)egidScan:(NSString *)knownDid;
 + (NSString *)containerRoot;
++ (BOOL)isUUID:(NSString *)s;
++ (NSString *)currentDID:(KSTarget *)t;
++ (BOOL)changeDID:(NSString *)did target:(KSTarget *)t;
++ (NSUInteger)replaceInFile:(NSString *)path old:(NSString *)oldDID new:(NSString *)newDID;
++ (NSUInteger)changeDIDInMMKV:(NSString *)oldDID to:(NSString *)newDID target:(KSTarget *)t;
 @end
 
 @implementation KSInjector
@@ -1603,6 +1608,265 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         return bestAny;
     }
     return nil;
+}
+
+/// 判断是否为标准 UUID 格式
++ (BOOL)isUUID:(NSString *)s {
+    if (!s.length) return NO;
+    NSRegularExpression *re =
+        [NSRegularExpression regularExpressionWithPattern:
+         @"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+          "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$" options:0 error:NULL];
+    return [re numberOfMatchesInString:s options:0
+                                 range:NSMakeRange(0, s.length)] > 0;
+}
+
+// ==================================================================
+// did 的 MMKV 存储处理
+//
+// ★ 实测（真机 2026-09）：
+//   快手「帮助 → 设备信息」里显示的 did 来自 MMKV，不是 plist！
+//   权威来源：<容器>/Documents/mmkv/kKSUMMKVStoreKey
+//     - 键名:  ksu_<did>                       （did 嵌在键名里）
+//     - 值:    base64 protobuf 的 uid_did_mapping_v2，内部含 did 两次
+//   同目录这些文件也含 did：
+//     com.kuaishou.ConfigCenter.KSStartupService （明文 did）
+//     kKSUHeartBeatReportKey                     （明文 did，键名里也带）
+//     com.kuaishou.KSNewDiskCache.startup
+//   明文文件 Library/Application Support/com.kuaishou.did 反而是【旧残留】。
+//
+// MMKV 这些文件是【明文】（未加密），did 是定长 36 字符 UUID，
+// 因此可以安全地做等长字节替换，不需要理解 MMKV 的编码格式。
+// ==================================================================
+
+/// 把文件里所有出现的 oldDID 替换成 newDID（等长替换，保持文件大小不变）
+/// 返回替换次数
++ (NSUInteger)replaceInFile:(NSString *)path
+                        old:(NSString *)oldDID
+                        new:(NSString *)newDID {
+    if (!path.length || !oldDID.length || !newDID.length) return 0;
+    if (oldDID.length != newDID.length) return 0;   // 必须等长
+
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (!data.length) return 0;
+
+    NSData *o = [oldDID dataUsingEncoding:NSASCIIStringEncoding];
+    NSData *n = [newDID dataUsingEncoding:NSASCIIStringEncoding];
+    if (!o.length || o.length != n.length) return 0;
+
+    NSMutableData *out = [NSMutableData dataWithCapacity:data.length];
+    const uint8_t *bytes = data.bytes;
+    NSUInteger len = data.length, i = 0, hits = 0;
+    const uint8_t *ob = o.bytes;
+    NSUInteger olen = o.length;
+
+    while (i < len) {
+        if (i + olen <= len && memcmp(bytes + i, ob, olen) == 0) {
+            [out appendBytes:n.bytes length:n.length];
+            i += olen;
+            hits++;
+        } else {
+            [out appendBytes:&bytes[i] length:1];
+            i++;
+        }
+    }
+    if (!hits) return 0;
+
+    NSError *e = nil;
+    if (![out writeToFile:path options:NSDataWritingAtomic error:&e]) {
+        [KSLog add:@"      ✗ 写入失败 %@: %@", [path lastPathComponent],
+         e.localizedDescription ?: @"未知"];
+        return 0;
+    }
+    return hits;
+}
+
+/// 修改 MMKV 目录下所有含 did 的文件
++ (NSUInteger)changeDIDInMMKV:(NSString *)oldDID
+                           to:(NSString *)newDID
+                       target:(KSTarget *)t {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dir = [t.dataContainer stringByAppendingPathComponent:@"Documents/mmkv"];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:dir isDirectory:&isDir] || !isDir) {
+        [KSLog add:@"      ⚠ mmkv 目录不存在"];
+        return 0;
+    }
+
+    // 优先处理已知含 did 的文件，再扫全目录兜底
+    NSArray *priority = @[
+        @"kKSUMMKVStoreKey",
+        @"com.kuaishou.ConfigCenter.KSStartupService",
+        @"kKSUHeartBeatReportKey",
+        @"com.kuaishou.KSNewDiskCache.startup",
+        @"kKSUMMKVStoreKey.crc",
+    ];
+
+    NSUInteger total = 0;
+    NSMutableSet *done = [NSMutableSet set];
+
+    for (NSString *name in priority) {
+        NSString *p = [dir stringByAppendingPathComponent:name];
+        if (![fm fileExistsAtPath:p]) continue;
+        [done addObject:name];
+        NSUInteger n = [self replaceInFile:p old:oldDID new:newDID];
+        if (n) {
+            [KSLog add:@"      %@ → 替换 %lu 处", name, (unsigned long)n];
+            total += n;
+        }
+    }
+
+    // 兜底：扫 mmkv 目录下其余文件
+    NSArray *all = [fm contentsOfDirectoryAtPath:dir error:NULL];
+    NSUInteger scanned = 0;
+    for (NSString *name in all) {
+        if ([done containsObject:name]) continue;
+        if (scanned++ > 300) break;
+        NSString *p = [dir stringByAppendingPathComponent:name];
+        BOOL fIsDir = NO;
+        if (![fm fileExistsAtPath:p isDirectory:&fIsDir] || fIsDir) continue;
+        NSDictionary *attr = [fm attributesOfItemAtPath:p error:NULL];
+        if ([attr fileSize] > 8 * 1024 * 1024 || [attr fileSize] == 0) continue;
+
+        NSUInteger n = [self replaceInFile:p old:oldDID new:newDID];
+        if (n) {
+            [KSLog add:@"      %@ → 替换 %lu 处", name, (unsigned long)n];
+            total += n;
+        }
+    }
+    return total;
+}
+
+/// 只读：取出当前 did
++ (NSString *)currentDID:(KSTarget *)t {
+    if (!t.prefsPath) return nil;
+    NSDictionary *d = [self loadPlistAt:t.prefsPath];
+    if (!d) return nil;
+
+    // 优先 plist 里的设备标识键
+    for (NSString *k in @[@"KLink_Persistent_klink.device_id", @"WeaponUUIDKey"]) {
+        id v = d[k];
+        if ([v isKindOfClass:[NSString class]] && [self isUUID:v]) return v;
+    }
+    // 回退：网络缓存里的 did=
+    return [self didFromNetworkCache];
+}
+
+/// 只修改 did（设备标识），不动 token/salt/api_st 等其他参数
+/// 同步更新三处：
+///   1) plist 的 KLink_Persistent_klink.device_id（登录判定用的就是它）
+///   2) plist 的 WeaponUUIDKey
+///   3) <容器>/Library/Application Support/com.kuaishou.did（明文文件）
++ (BOOL)changeDID:(NSString *)did target:(KSTarget *)t {
+    if (![self isUUID:did]) {
+        [KSLog add:@"✗ did 格式不对，必须是标准 UUID"];
+        [KSLog add:@"   例: 4C96E59A-0F12-47E8-B56B-FFB036C694CB"];
+        return NO;
+    }
+    if (!t.prefsPath) {
+        [KSLog add:@"✗ 未定位到快手偏好文件"];
+        return NO;
+    }
+
+    NSString *oldDID = [self currentDID:t];
+    [KSLog add:@"===== 修改 did ====="];
+    [KSLog add:@"  旧: %@", oldDID ?: @"(无)"];
+    [KSLog add:@"  新: %@", did];
+
+    // ---- 1) 停快手（必须确认退出，否则会被它写回）----
+    [KSLog add:@"[1/5] 结束快手进程..."];
+    BOOL killed = [self killKuaishouAndWait];
+    [KSLog add:@"      %@", killed ? @"✓ 已退出" : @"⚠ 未能确认退出，可能失败"];
+
+    // ---- 2) ★ 改 MMKV（快手界面显示的就是这里的值，最关键）----
+    [KSLog add:@"[2/5] 修改 MMKV 存储..."];
+    NSUInteger mmkvHits = 0;
+    if (oldDID.length && ![oldDID isEqualToString:did]) {
+        mmkvHits = [self changeDIDInMMKV:oldDID to:did target:t];
+        if (mmkvHits) {
+            [KSLog add:@"      ✓ MMKV 共替换 %lu 处", (unsigned long)mmkvHits];
+        } else {
+            [KSLog add:@"      ⚠ MMKV 里没找到旧 did（可能已改过）"];
+        }
+    } else if (!oldDID.length) {
+        [KSLog add:@"      ⚠ 读不到旧 did，跳过 MMKV 替换"];
+    }
+
+    // ---- 3) 改 plist ----
+    [KSLog add:@"[3/5] 写入 plist..."];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDictionary *cur = [self loadPlistAt:t.prefsPath];
+    if (!cur.count) {
+        [KSLog add:@"      ✗ 读不到现有 plist"];
+        return NO;
+    }
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:cur];
+
+    NSUInteger n = 0;
+    d[@"KLink_Persistent_klink.device_id"] = did; n++;
+    d[@"WeaponUUIDKey"] = did; n++;
+    // 只更新【已存在】的同族键，不凭空造键
+    for (NSString *k in @[@"cloud_did", @"kKSClientDID", @"client_did"]) {
+        if (d[k]) { d[k] = did; n++; }
+    }
+
+    // 与其他写操作一致：先清缓存再写，避免 cfprefsd 用内存旧值覆盖
+    [self flushDaemons];
+    usleep(300 * 1000);
+
+    NSString *tmp = [t.prefsPath stringByAppendingString:@".ks_tmp"];
+    if (![d writeToFile:tmp atomically:YES]) {
+        [KSLog add:@"      ✗ plist 写入失败"];
+        return NO;
+    }
+    [fm removeItemAtPath:t.prefsPath error:NULL];
+    [fm moveItemAtPath:tmp toPath:t.prefsPath error:NULL];
+    [self fixOwnership:t.prefsPath target:t];
+    [self flushDaemons];
+    usleep(200 * 1000);
+    [KSLog add:@"      ✓ 已更新 %lu 个键", (unsigned long)n];
+
+    // 回读校验
+    NSDictionary *chk = [self loadPlistAt:t.prefsPath];
+    NSString *got = chk[@"KLink_Persistent_klink.device_id"];
+    if ([got isEqualToString:did]) {
+        [KSLog add:@"      ✓ 校验通过: %@", got];
+    } else {
+        [KSLog add:@"      ⚠ 校验失败，读回: %@", got ?: @"(空)"];
+    }
+
+    // ---- 4) 改明文 did 文件 ----
+    [KSLog add:@"[4/5] 写入 did 文件..."];
+    NSString *didPath = [t.dataContainer
+        stringByAppendingPathComponent:@"Library/Application Support/com.kuaishou.did"];
+    if ([fm fileExistsAtPath:didPath]) {
+        NSString *old = [NSString stringWithContentsOfFile:didPath
+                                                  encoding:NSUTF8StringEncoding error:NULL];
+        [KSLog add:@"      旧值: %@", old ?: @"(空)"];
+        NSString *bak = [didPath stringByAppendingString:@".ksbak"];
+        if (![fm fileExistsAtPath:bak] && old.length) {
+            [fm copyItemAtPath:didPath toPath:bak error:NULL];
+        }
+        if ([did writeToFile:didPath atomically:YES
+                    encoding:NSUTF8StringEncoding error:NULL]) {
+            [self fixOwnership:didPath target:t];
+            [KSLog add:@"      ✓ did 文件已写入"];
+        } else {
+            [KSLog add:@"      ⚠ did 文件写入失败（不影响登录，可忽略）"];
+        }
+    } else {
+        [KSLog add:@"      该文件不存在，跳过"];
+    }
+
+    // ---- 5) 刷新缓存 + 拉起快手 ----
+    [KSLog add:@"[5/5] 刷新缓存并拉起快手..."];
+    [self flushDaemons];
+    usleep(300 * 1000);
+    [KSTarget launch:t.bundleID];
+
+    [KSLog add:@"✓ did 修改完成 → %@", did];
+    [KSLog add:@"  （可在快手「我 → 三横 → 帮助 → 设备信息」里核对）"];
+    return YES;
 }
 
 /// 快手数据容器根（缓存一份，避免重复探测）

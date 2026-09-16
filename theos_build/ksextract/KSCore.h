@@ -114,6 +114,17 @@
 /// 提取当前设备五参并拼接成一行（---- 分隔），同时写日志。失败返回 nil
 + (NSString *)currentFiveLine:(KSTarget *)target;
 
+/// 只修改 did（设备标识），不改 token/salt 等其他参数
+/// @param did 新的 did（标准 UUID，如 4C96E59A-0F12-47E8-B56B-FFB036C694CB）
+/// @return 是否成功
++ (BOOL)changeDID:(NSString *)did target:(KSTarget *)target;
+
+/// 只读：取出当前 did（不修改任何东西），失败返回 nil
++ (NSString *)currentDID:(KSTarget *)target;
+
+/// 判断字符串是否为标准 UUID 格式
++ (BOOL)isUUID:(NSString *)s;
+
 /// 清除登录态（回到未登录）
 + (BOOL)clearLogin:(KSTarget *)target;
 
