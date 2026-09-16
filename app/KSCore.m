@@ -756,29 +756,10 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
     pid_t p2 = [self pidFromProcForBundle:bundleID];
     if (p2 > 0) return p2;
 
-    // 再兜底：launchctl（部分环境可用）
-    NSArray *paths = @[@"/usr/bin/launchctl", @"/var/jb/usr/bin/launchctl"];
-    for (NSString *lp in paths) {
-        NSArray *lines = runCmdCapture(lp, @[@"list"]);
-        if (!lines || !lines.count) continue;
-        NSString *needle = [NSString stringWithFormat:@"UIKitApplication:%@", bundleID];
-        for (NSString *l in lines) {
-            if (![l containsString:needle]) continue;
-            NSCharacterSet *ws = [NSCharacterSet whitespaceCharacterSet];
-            NSUInteger i = 0;
-            while (i < l.length && [ws characterIsMember:[l characterAtIndex:i]]) i++;
-            NSUInteger start = i;
-            while (i < l.length &&
-                   [[NSCharacterSet decimalDigitCharacterSet]
-                    characterIsMember:[l characterAtIndex:i]]) i++;
-            if (i > start) {
-                NSString *num = [l substringWithRange:NSMakeRange(start, i - start)];
-                pid_t r = (pid_t)[num intValue];
-                [KSLog add:@"  launchctl 命中 → PID=%d", (int)r];
-                return r;
-            }
-        }
-    }
+    // ★★ 绝不在这里 spawn 外部程序！
+    //   实测：RootHide 下 posix_spawn 启动的进程永不返回，
+    //   waitpid 会【永久阻塞】，导致 UI 完全卡死（"点什么都没反应"）。
+    //   进程枚举只走 libproc / sysctl / proc 三条纯 API 路径。
     return 0;
 }
 
@@ -943,12 +924,10 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         }
     }
 
-    // ---- 第 2 轮：killall 兜底（对老版本/其他进程名有效）----
-    NSArray *names = @[@"com_kwai_gif", @"com.kuaishou.nebula", @"Kwai"];
-    for (NSString *kp in killallPaths) {
-        if (![fm fileExistsAtPath:kp]) continue;
-        for (NSString *n in names) runCmd(kp, @[@"-9", n]);
-    }
+    // ---- 第 2 轮：不再用 killall ----
+    //   ★ 实测：App 内 posix_spawn 在 RootHide 下会永久阻塞（waitpid 不返回），
+    //     导致 UI 卡死。而且 killall 本来也看不到快手进程（沙盒隔离）。
+    //     所以只保留 libproc+kill() 这一条可靠路径。
 
     if (!didKill) {
         [KSLog add:@"  未找到快手进程（可能本来就没运行）"];
@@ -1255,10 +1234,13 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 }
 
 /// 终止容器管理/偏好守护进程，确保我们写的文件不会被内存缓存覆盖
+/// ★ 不能用 posix_spawn（RootHide 下会永久阻塞导致 UI 卡死），
+///   改用 libproc 找 PID + kill() 系统调用。
 + (void)flushDaemons {
     NSArray *daemons = @[@"cfprefsd", @"containermanagerd"];
-    for (NSString *d in daemons) {
-        runCmd(@"/usr/bin/killall", @[@"-9", d]);
+    for (NSString *name in daemons) {
+        pid_t p = ks_find_pid_by_path_keyword(@[name]);
+        if (p > 0) kill(p, SIGKILL);
     }
 }
 
@@ -2157,23 +2139,29 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
 }
 
 /// 老版快手的 token 在 kwapp_host_path_db.db 的 host_path_table 里（host_id-owner_id）
+/// ★ 这里原本用 sqlite3 命令行提取，但 posix_spawn 在 RootHide 下会永久阻塞，
+///   为安全起见改为不 spawn。新版快手不走这条路，影响可忽略。
 + (NSString *)tokenFromKwappDB:(KSTarget *)t {
     NSString *db = [t.dataContainer stringByAppendingPathComponent:
                     @"Library/KWApp/kwapp_host_path_db.db"];
     if (![[NSFileManager defaultManager] fileExistsAtPath:db]) return nil;
 
-    NSString *sqlPath = [NSTemporaryDirectory()
-                         stringByAppendingPathComponent:@"ks_kwapp.sql"];
-    // 用 sqlite3 命令行提取（避免引入 libsqlite3 依赖）
-    NSString *sql = @"SELECT host_id || '-' || owner_id FROM host_path_table LIMIT 1;";
-    if (![sql writeToFile:sqlPath atomically:YES encoding:NSUTF8StringEncoding error:NULL])
-        return nil;
+    // 直接从 db 文件里正则扫 "32位hex-数字" 形态的 token（不依赖 sqlite3）
+    NSData *data = [NSData dataWithContentsOfFile:db];
+    if (!data.length || data.length > 8 * 1024 * 1024) return nil;
+    NSString *txt = [[NSString alloc] initWithData:data
+                                          encoding:NSISOLatin1StringEncoding];
+    if (!txt.length) return nil;
 
-    NSArray *lines = runCmdCapture(@"/usr/bin/sqlite3", @[db, sql]);
-    for (NSString *l in lines) {
-        NSString *v = [l stringByTrimmingCharactersInSet:
-                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (v.length) return v;
+    NSRegularExpression *re =
+        [NSRegularExpression regularExpressionWithPattern:
+         @"[0-9a-fA-F]{32}-\\d{6,}" options:0 error:NULL];
+    NSTextCheckingResult *m = [re firstMatchInString:txt options:0
+                                               range:NSMakeRange(0, txt.length)];
+    if (m) {
+        NSString *v = [txt substringWithRange:m.range];
+        [KSLog add:@"  token 从 kwapp DB 提取: %@", v];
+        return v;
     }
     return nil;
 }
