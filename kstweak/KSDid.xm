@@ -145,7 +145,7 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
 
 static void ks_install(void) {
     g_customDid = ks_loadCustomDid();
-    if (!ks_customDid.length) {
+    if (!g_customDid.length) {
         NSLog(@"[KSDid] 未配置 did，插件不生效");
         return;
     }
