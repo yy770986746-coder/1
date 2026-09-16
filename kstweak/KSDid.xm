@@ -1,12 +1,14 @@
-// 诊断版 v3：输出 Keychain 返回值的实际内容（含 hex），定位 did
+// 诊断版 v4：全量扫描所有 Keychain 项，找出含 did 的那个
+// 已知：KSCommonIDFAKeychainKey → 49847123-... / com.kwai.openSDK.deviceId → CD9BD127-...
+//       这两个都不是界面显示的 did（7F00CDE1），需继续找
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 
-static NSString *g_customDid = nil;
 static NSString *g_logPath = nil;
 static int g_callCount = 0;
+static NSString *g_targetDID = @"7F00CDE1";
 
 static NSString *ks_logPath(void) {
     if (g_logPath) return g_logPath;
@@ -43,55 +45,42 @@ static void ks_log(NSString *fmt, ...) {
     } @catch (NSException *e) {}
 }
 
-static NSString *ks_loadCustomDid(void) {
-    NSMutableArray *paths = [NSMutableArray array];
-    NSString *home = NSHomeDirectory();
-    if (home.length) {
-        [paths addObject:[home stringByAppendingPathComponent:@"Documents/ks_did.txt"]];
-    }
-    [paths addObject:@"/var/mobile/Documents/ks_did.txt"];
-    for (NSString *p in paths) {
-        NSString *t = [NSString stringWithContentsOfFile:p
-                                                encoding:NSUTF8StringEncoding error:NULL];
-        t = [t stringByTrimmingCharactersInSet:
-             [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (t.length == 36) return t;
-    }
-    return nil;
-}
-
-/// 把 NSData 转成可读描述：尝试 UTF8，失败则 hex（前 80 字节）
-static NSString *ks_dataDesc(NSData *d) {
-    if (!d.length) return @"(空)";
-    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-    if (s.length && s.length < 400) {
-        // 纯文本
-        return [NSString stringWithFormat:@"文本(%lu): %@", (unsigned long)d.length, s];
-    }
-    // bplist?
-    NSRange r = [d rangeOfData:[@"bplist" dataUsingEncoding:NSUTF8StringEncoding]
-                       options:0 range:NSMakeRange(0, MIN((NSUInteger)64, d.length))];
-    NSString *tag = (r.location != NSNotFound) ? @"bplist" : @"二进制";
-
+static NSString *ks_fullHex(NSData *d) {
+    if (!d.length) return @"";
     NSMutableString *hex = [NSMutableString string];
     const uint8_t *b = (const uint8_t *)d.bytes;
-    NSUInteger n = MIN((NSUInteger)80, d.length);
+    NSUInteger n = MIN((NSUInteger)400, d.length);
     for (NSUInteger i = 0; i < n; i++) [hex appendFormat:@"%02x", b[i]];
+    if (d.length > n) [hex appendFormat:@"...(%lu字节)", (unsigned long)d.length];
+    return hex;
+}
 
-    // 找明文 UUID（如果有）
+/// 找所有 UUID（标准格式 + 32位hex变体）
+static NSString *ks_findUUIDs(NSData *d) {
     NSString *raw = [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
-    NSString *found = @"";
+    if (!raw.length) return @"";
+    NSMutableArray *found = [NSMutableArray array];
+
     NSRegularExpression *re =
         [NSRegularExpression regularExpressionWithPattern:
          @"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
           "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}" options:0 error:NULL];
-    if (raw.length) {
-        NSTextCheckingResult *m = [re firstMatchInString:raw options:0
-                                                   range:NSMakeRange(0, raw.length)];
-        if (m) found = [NSString stringWithFormat:@" UUID=%@", [raw substringWithRange:m.range]];
+    for (NSTextCheckingResult *m in [re matchesInString:raw options:0
+                                                  range:NSMakeRange(0, raw.length)]) {
+        [found addObject:[raw substringWithRange:m.range]];
     }
-    return [NSString stringWithFormat:@"%@(%lu)%@ hex=%s",
-            tag, (unsigned long)d.length, found, hex.UTF8String];
+
+    NSRegularExpression *re2 =
+        [NSRegularExpression regularExpressionWithPattern:@"[0-9A-Fa-f]{32}"
+                                                  options:0 error:NULL];
+    for (NSTextCheckingResult *m in [re2 matchesInString:raw options:0
+                                                   range:NSMakeRange(0, raw.length)]) {
+        NSString *h = [[raw substringWithRange:m.range] uppercaseString];
+        if ([h rangeOfString:g_targetDID].location != NSNotFound) {
+            [found addObject:[NSString stringWithFormat:@"HEX32:%@", h]];
+        }
+    }
+    return found.count ? [found componentsJoinedByString:@" | "] : @"";
 }
 
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
@@ -100,47 +89,28 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
     OSStatus ret = orig_SecItemCopyMatching(query, result);
 
     @try {
-        if (!query) return ret;
+        if (!query || ret != errSecSuccess || !result || !*result) return ret;
         g_callCount++;
 
         NSDictionary *q = (__bridge NSDictionary *)query;
         id svc  = q[(__bridge id)kSecAttrService];
-        id acctRaw = q[(__bridge id)kSecAttrAccount];
-        NSString *svcS = [svc isKindOfClass:[NSString class]] ? svc : @"";
-        // acct 在快手这版里与 svc 相同，仅作兜底匹配
-        NSString *acctS = [acctRaw isKindOfClass:[NSString class]] ? acctRaw : @"";
+        NSString *svcS = [svc isKindOfClass:[NSString class]] ? svc : @"(无)";
 
-        // 只关心这些候选键
-        BOOL interesting = NO;
-        for (NSString *k in @[@"KSCommonIDFA", @"openSDK.deviceId", @"weapon",
-                              @"CiInfo", @"did", @"Did", @"DID", @"device",
-                              @"EAccount", @"IDFA", @"idfa", @"DFP"]) {
-            if (svcS.length && [svcS rangeOfString:k].location != NSNotFound) {
-                interesting = YES; break;
-            }
-            if (acctS.length && [acctS rangeOfString:k].location != NSNotFound) {
-                interesting = YES; break;
-            }
+        id v = (__bridge id)*result;
+        NSData *data = nil;
+        if ([v isKindOfClass:[NSData class]]) {
+            data = (NSData *)v;
+        } else if ([v isKindOfClass:[NSDictionary class]]) {
+            id d2 = ((NSDictionary *)v)[(__bridge id)kSecValueData];
+            if ([d2 isKindOfClass:[NSData class]]) data = d2;
         }
+        if (!data.length) return ret;
 
-        if (interesting) {
-            ks_log(@"[C%d] svc=%@ ret=%d", g_callCount, svcS, (int)ret);
-            if (result && *result) {
-                id v = (__bridge id)*result;
-                if ([v isKindOfClass:[NSData class]]) {
-                    ks_log(@"     data: %@", ks_dataDesc((NSData *)v));
-                } else if ([v isKindOfClass:[NSDictionary class]]) {
-                    NSDictionary *dd = (NSDictionary *)v;
-                    id data2 = dd[(__bridge id)kSecValueData];
-                    if ([data2 isKindOfClass:[NSData class]]) {
-                        ks_log(@"     dict.data: %@", ks_dataDesc((NSData *)data2));
-                    } else {
-                        ks_log(@"     dict keys: %@", [[dd allKeys] componentsJoinedByString:@","]);
-                    }
-                } else {
-                    ks_log(@"     %@: %@", NSStringFromClass([v class]), v);
-                }
-            }
+        NSString *uuids = ks_findUUIDs(data);
+        if (uuids.length) {
+            ks_log(@"[C%d] %@ (%lu字节)", g_callCount, svcS, (unsigned long)data.length);
+            ks_log(@"     UUID: %@", uuids);
+            ks_log(@"     hex: %@", ks_fullHex(data));
         }
     } @catch (NSException *e) {
         ks_log(@"[ERR] %@", e.reason);
@@ -153,10 +123,9 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
         [[NSFileManager defaultManager] removeItemAtPath:
          [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ksdid_log.txt"]
                                                  error:NULL];
-        g_customDid = ks_loadCustomDid();
-        ks_log(@"===== KSDid 诊断版 v3 =====");
+        ks_log(@"===== KSDid v4 (全量UUID扫描) =====");
         ks_log(@"沙盒: %@", NSHomeDirectory());
-        ks_log(@"自定义 did = %@", g_customDid ?: @"(未配置)");
+        ks_log(@"目标 did 前缀: %@", g_targetDID);
 
         MSHookFunction((void *)SecItemCopyMatching,
                        (void *)my_SecItemCopyMatching,
