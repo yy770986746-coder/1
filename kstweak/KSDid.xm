@@ -1,9 +1,9 @@
-// 诊断版 v5：读出 IDFV / IDFA，验证 did 与它们的关系
+// 诊断版 v6：dump CiInfoKey_Re_N 的完整内容（did 的 Keychain 项）
+// v5 已确认：CiInfoKey_Re_N 存在（292 字节），IDFV=2D012E52-...，IDFA=49847123-...
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <substrate.h>
 
 static NSString *g_logPath = nil;
 
@@ -42,63 +42,57 @@ static void ks_log(NSString *fmt, ...) {
     } @catch (NSException *e) {}
 }
 
-// ---------- 读 IDFV / IDFA ----------
+static NSString *ks_hex(NSData *d, NSUInteger max) {
+    if (!d.length) return @"";
+    NSMutableString *s = [NSMutableString string];
+    const uint8_t *b = (const uint8_t *)d.bytes;
+    NSUInteger n = MIN(max, d.length);
+    for (NSUInteger i = 0; i < n; i++) [s appendFormat:@"%02x", b[i]];
+    return s;
+}
 
-static void ks_dumpIdentifiers(void) {
-    // IDFV
+static void ks_dumpKey(NSString *key) {
     @try {
-        if ([[UIDevice currentDevice] respondsToSelector:@selector(identifierForVendor)]) {
-            NSUUID *idfv = [[UIDevice currentDevice] identifierForVendor];
-            ks_log(@"[IDFV] %@", idfv.UUIDString ?: @"(nil)");
+        NSDictionary *q = @{
+            (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrService: key,
+            (__bridge id)kSecReturnData: @YES,
+            (__bridge id)kSecReturnAttributes: @YES,
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne
+        };
+        CFTypeRef r = NULL;
+        OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &r);
+        ks_log(@"---- %@ (status=%d) ----", key, (int)st);
+        if (st != errSecSuccess || !r) { ks_log(@"     (读取失败)"); return; }
+
+        NSDictionary *d = (__bridge_transfer NSDictionary *)r;
+        NSData *data = d[(__bridge id)kSecValueData];
+        NSData *acct = d[(__bridge id)kSecAttrAccount];
+        NSString *acctS = [[NSString alloc] initWithData:acct encoding:NSUTF8StringEncoding];
+
+        ks_log(@"     account: %@", acctS ?: @"(非文本)");
+        ks_log(@"     长度: %lu 字节", (unsigned long)data.length);
+
+        NSString *txt = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (txt.length) ks_log(@"     文本: %@", txt);
+
+        NSRange br = [data rangeOfData:[@"bplist" dataUsingEncoding:NSUTF8StringEncoding]
+                               options:0 range:NSMakeRange(0, MIN((NSUInteger)32, data.length))];
+        ks_log(@"     格式: %@", br.location != NSNotFound ? @"bplist" : @"二进制");
+
+        NSString *raw = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
+        NSRegularExpression *re =
+            [NSRegularExpression regularExpressionWithPattern:
+             @"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+              "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}" options:0 error:NULL];
+        for (NSTextCheckingResult *m in [re matchesInString:raw options:0
+                                                      range:NSMakeRange(0, raw.length)]) {
+            ks_log(@"     ★ UUID: %@", [raw substringWithRange:m.range]);
         }
-    } @catch (NSException *e) { ks_log(@"[IDFV] 异常: %@", e.reason); }
 
-    // IDFA
-    @try {
-        Class ASIdentifierManager = NSClassFromString(@"ASIdentifierManager");
-        if (ASIdentifierManager) {
-            id mgr = [ASIdentifierManager performSelector:@selector(sharedManager)];
-            if (mgr) {
-                if ([mgr respondsToSelector:@selector(advertisingIdentifier)]) {
-                    NSUUID *idfa = [mgr performSelector:@selector(advertisingIdentifier)];
-                    ks_log(@"[IDFA] %@", idfa.UUIDString ?: @"(nil)");
-                }
-                SEL sel = NSSelectorFromString(@"isAdvertisingTrackingEnabled");
-                if ([mgr respondsToSelector:sel]) {
-                    BOOL b = ((BOOL(*)(id, SEL))objc_msgSend)(mgr, sel);
-                    ks_log(@"[IDFA] trackingEnabled=%d", (int)b);
-                }
-            }
-        } else {
-            ks_log(@"[IDFA] ASIdentifierManager 不存在");
-        }
-    } @catch (NSException *e) { ks_log(@"[IDFA] 异常: %@", e.reason); }
-
-    // 其他系统标识
-    @try {
-        NSDictionary *d = [[NSBundle mainBundle] infoDictionary];
-        ks_log(@"[Bundle] %@", d[@"CFBundleIdentifier"] ?: @"?");
-    } @catch (NSException *e) {}
-
-    // Keychain 里所有 CiInfo / did 相关（用明文 key 试）
-    NSArray *keys = @[@"CiInfoKey_Re_N", @"CiInfoKey_Re", @"cloud_did",
-                      @"did", @"kuaishou_did", @"KSDidKeychainKey"];
-    for (NSString *k in keys) {
-        @try {
-            NSDictionary *q = @{
-                (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-                (__bridge id)kSecAttrService: k,
-                (__bridge id)kSecReturnData: @YES,
-                (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne
-            };
-            CFTypeRef r = NULL;
-            OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &r);
-            if (st == errSecSuccess && r) {
-                NSData *dd = (__bridge_transfer NSData *)r;
-                NSString *s = [[NSString alloc] initWithData:dd encoding:NSUTF8StringEncoding];
-                ks_log(@"[KC %@] %@", k, s.length ? s : [NSString stringWithFormat:@"%lu 字节", (unsigned long)dd.length]);
-            }
-        } @catch (NSException *e) {}
+        ks_log(@"     hex: %@", ks_hex(data, 400));
+    } @catch (NSException *e) {
+        ks_log(@"  异常: %@", e.reason);
     }
 }
 
@@ -107,14 +101,15 @@ static void ks_dumpIdentifiers(void) {
         [[NSFileManager defaultManager] removeItemAtPath:
          [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ksdid_log.txt"]
                                                  error:NULL];
-        ks_log(@"===== KSDid v5 (读系统标识) =====");
+        ks_log(@"===== KSDid v6 (dump CiInfoKey) =====");
         ks_log(@"沙盒: %@", NSHomeDirectory());
 
-        // 延迟执行，等 App 完全启动
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(0, 0), ^{
-            ks_dumpIdentifiers();
-            ks_log(@"===== 标识读取完成 =====");
+            ks_log(@"[IDFV] %@", [[UIDevice currentDevice] identifierForVendor].UUIDString);
+            ks_dumpKey(@"CiInfoKey_Re_N");
+            ks_dumpKey(@"CiInfoKey_Re");
+            ks_log(@"===== 完成 =====");
         });
     }
 }
