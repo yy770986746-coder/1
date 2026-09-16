@@ -1,22 +1,11 @@
 // ==================================================================
 //  KSDid —— 快手自定义 did（注入插件）
 //
-//  原理：
-//    快手把 did 加密存在 Keychain 的 "CiInfoKey_Re_N" 条目里。
-//    本插件注入快手进程后：
-//      ① hook SecItemCopyMatching —— 快手【读】did 时替换成自定义值
-//      ② hook SecItemAdd        —— 快手的 SDK 首次【写】did 时也替换
-//
-//  配置（按优先级）：
-//    1) /var/mobile/Library/Preferences/com.kuaishou.ksdid.plist  键 did
-//    2) /var/mobile/Documents/ks_did.txt                          一行 UUID
-//
-//  日志：/var/mobile/Documents/ksdid_log.txt（便于排查）
-//
-//  安全设计：
-//    - 全程 @try/@catch，异常不影响快手
-//    - 只在明确命中 did 条目且类型安全时才替换，否则原样返回
-//    - 绝不在读取路径上做任何耗时操作
+//  ★ 重要：插件注入到【快手的沙盒】里运行，
+//    写 /var/mobile/Documents 会被沙盒拒绝（日志一直是空的）。
+//    必须写到【快手自己的沙盒目录】：
+//      /var/mobile/Containers/Data/Application/<UUID>/Documents/ksdid_log.txt
+//    代码里用 NSHomeDirectory() 动态获取。
 // ==================================================================
 
 #import <Foundation/Foundation.h>
@@ -25,40 +14,86 @@
 #import <substrate.h>
 
 static NSString *g_customDid = nil;
+static NSString *g_logPath = nil;
 
-// ---------- 日志 ----------
+/// 日志路径：优先快手沙盒，回退几个常见位置
+static NSString *ks_logPath(void) {
+    if (g_logPath) return g_logPath;
+    NSMutableArray *cands = [NSMutableArray array];
+
+    // 1) 当前进程的沙盒（注入到快手后就是快手的沙盒）
+    NSString *home = NSHomeDirectory();
+    if (home.length) {
+        [cands addObject:[home stringByAppendingPathComponent:@"Documents/ksdid_log.txt"]];
+        [cands addObject:[home stringByAppendingPathComponent:@"Library/ksdid_log.txt"]];
+        [cands addObject:[home stringByAppendingPathComponent:@"tmp/ksdid_log.txt"]];
+    }
+    // 2) 绝对路径兜底
+    [cands addObject:@"/var/mobile/Documents/ksdid_log.txt"];
+    [cands addObject:@"/tmp/ksdid_log.txt"];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *p in cands) {
+        NSString *dir = [p stringByDeletingLastPathComponent];
+        if (![fm fileExistsAtPath:dir]) continue;
+        // 试写
+        if ([@"init" writeToFile:p atomically:YES
+                        encoding:NSUTF8StringEncoding error:NULL]) {
+            g_logPath = p;
+            return p;
+        }
+    }
+    g_logPath = cands.firstObject;
+    return g_logPath;
+}
 
 static void ks_log(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSString *line = [msg stringByAppendingString:@"\n"];
-    NSString *path = @"/var/mobile/Documents/ksdid_log.txt";
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (fh) {
-        @try {
+    NSString *path = ks_logPath();
+    @try {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (fh) {
             [fh seekToEndOfFile];
             [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        } @catch (NSException *e) {}
-        [fh closeFile];
-    } else {
-        [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-    }
+            [fh closeFile];
+        } else {
+            [line writeToFile:path atomically:YES
+                     encoding:NSUTF8StringEncoding error:NULL];
+        }
+    } @catch (NSException *e) {}
 }
 
-// ---------- 配置 ----------
+// ---------- 配置：也要从沙盒里读 ----------
 
 static NSString *ks_loadCustomDid(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:
-                       @"/var/mobile/Library/Preferences/com.kuaishou.ksdid.plist"];
-    id v = d[@"did"];
-    if ([v isKindOfClass:[NSString class]] && ((NSString *)v).length == 36) return v;
+    NSMutableArray *paths = [NSMutableArray array];
+    NSString *home = NSHomeDirectory();
+    if (home.length) {
+        [paths addObject:[home stringByAppendingPathComponent:@"Documents/ks_did.txt"]];
+        [paths addObject:[home stringByAppendingPathComponent:
+                          @"Library/Preferences/com.kuaishou.ksdid.plist"]];
+    }
+    [paths addObject:@"/var/mobile/Documents/ks_did.txt"];
+    [paths addObject:@"/var/mobile/Library/Preferences/com.kuaishou.ksdid.plist"];
 
-    NSString *t = [NSString stringWithContentsOfFile:@"/var/mobile/Documents/ks_did.txt"
-                                            encoding:NSUTF8StringEncoding error:NULL];
-    t = [t stringByTrimmingCharactersInSet:
-         [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    return t.length == 36 ? t : nil;
+    for (NSString *p in paths) {
+        if ([p hasSuffix:@".plist"]) {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+            id v = d[@"did"];
+            if ([v isKindOfClass:[NSString class]] && ((NSString *)v).length == 36)
+                return v;
+        } else {
+            NSString *t = [NSString stringWithContentsOfFile:p
+                                                    encoding:NSUTF8StringEncoding error:NULL];
+            t = [t stringByTrimmingCharactersInSet:
+                 [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (t.length == 36) return t;
+        }
+    }
+    return nil;
 }
 
 static BOOL ks_isUUID(NSString *s) {
@@ -89,7 +124,6 @@ static NSString *ks_replaceUUIDs(NSString *src, NSString *newDid) {
     return out;
 }
 
-/// 判断某个 Keychain 查询是否与 did 相关
 static BOOL ks_isDidKey(NSDictionary *q) {
     id svc  = q[(__bridge id)kSecAttrService];
     id acct = q[(__bridge id)kSecAttrAccount];
@@ -104,7 +138,7 @@ static BOOL ks_isDidKey(NSDictionary *q) {
     return NO;
 }
 
-// ---------- hook: 读 ----------
+// ---------- hook ----------
 
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
 
@@ -113,16 +147,17 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
 
     @try {
         if (ret != errSecSuccess || !result || !*result || !query) return ret;
-        if (!g_customDid.length) return ret;
 
         NSDictionary *q = (__bridge NSDictionary *)query;
-        if (!ks_isDidKey(q)) return ret;
+        BOOL isDid = ks_isDidKey(q);
+        if (isDid) {
+            ks_log(@"[HIT] 查 did 条目 → %@", [q description]);
+        }
+        if (!isDid || !g_customDid.length) return ret;
 
         id val = (__bridge id)*result;
-        NSString *s = nil;
-        BOOL isDictResult = NO;
         NSData *data = nil;
-
+        BOOL isDictResult = NO;
         if ([val isKindOfClass:[NSData class]]) {
             data = (NSData *)val;
         } else if ([val isKindOfClass:[NSDictionary class]]) {
@@ -132,8 +167,9 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
         }
         if (!data.length || data.length > 1024 * 256) return ret;
 
-        s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
         if (!s.length) return ret;
+        ks_log(@"[VAL] 原值: %.200@", s);
 
         NSString *target = s;
         BOOL wasBase64 = NO;
@@ -146,14 +182,17 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
         }
 
         NSString *replaced = ks_replaceUUIDs(target, g_customDid);
-        if ([replaced isEqualToString:target]) return ret;
+        if ([replaced isEqualToString:target]) {
+            ks_log(@"[SKIP] 没有 UUID 可替换");
+            return ret;
+        }
 
         NSData *newData = wasBase64
             ? [[replaced dataUsingEncoding:NSUTF8StringEncoding] base64EncodedDataWithOptions:0]
             : [replaced dataUsingEncoding:NSUTF8StringEncoding];
         if (!newData.length) return ret;
 
-        ks_log(@"[READ] 替换 did: %@ → %@", target, replaced);
+        ks_log(@"[SET] %@ → %@", target, replaced);
 
         if (!isDictResult) {
             CFTypeRef old = *result;
@@ -167,26 +206,22 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
             if (old) CFRelease(old);
         }
     } @catch (NSException *e) {
-        ks_log(@"[READ] 异常: %@", e.reason);
+        ks_log(@"[ERR] %@", e.reason);
     } @catch (...) {
     }
     return ret;
 }
 
-// ---------- 启动 ----------
-
 %ctor {
     @autoreleasepool {
-        [[NSFileManager defaultManager] removeItemAtPath:
-         @"/var/mobile/Documents/ksdid_log.txt" error:NULL];
-
         g_customDid = ks_loadCustomDid();
         ks_log(@"===== KSDid 启动 =====");
+        ks_log(@"沙盒: %@", NSHomeDirectory());
         ks_log(@"自定义 did = %@", g_customDid ?: @"(未配置)");
 
         MSHookFunction((void *)SecItemCopyMatching,
                        (void *)my_SecItemCopyMatching,
                        (void **)&orig_SecItemCopyMatching);
-        ks_log(@"SecItemCopyMatching hook 已安装");
+        ks_log(@"hook 已安装");
     }
 }
