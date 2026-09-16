@@ -102,17 +102,6 @@ static void ks_dumpIdentifiers(void) {
     }
 }
 
-// ---------- hook: 拦截 did 相关查询 ----------
-
-static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
-static int g_n = 0;
-
-static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    OSStatus ret = orig_SecItemCopyMatching(query, result);
-    // v5 只做观察，不修改
-    return ret;
-}
-
 %ctor {
     @autoreleasepool {
         [[NSFileManager defaultManager] removeItemAtPath:
