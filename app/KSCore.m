@@ -2118,6 +2118,41 @@ static NSArray<NSString *> *runCmdCapture(NSString *path, NSArray<NSString *> *a
         [KSLog add:@"      该文件不存在，跳过"];
     }
 
+    // ---- 4.5) ★ 写插件配置 ks_did.txt（插件 v21 读它做网络层双向替换）----
+    //   这是 iOS 上生效的【关键】：
+    //   iOS 快手的 did 由服务端下发（cloud_did），本地存储改了也会被覆盖，
+    //   必须靠插件在 NSURLRequest / NSJSONSerialization 两端实时替换。
+    [KSLog add:@"[4.5/5] 写插件配置 ks_did.txt..."];
+    {
+        NSMutableArray *cands = [NSMutableArray array];
+        if ([t.dataContainer length])
+            [cands addObject:[t.dataContainer
+                stringByAppendingPathComponent:@"Documents/ks_did.txt"]];
+        [cands addObject:@"/var/mobile/Documents/ks_did.txt"];
+        BOOL wrote = NO;
+        for (NSString *p in cands) {
+            if ([did writeToFile:p atomically:YES
+                        encoding:NSUTF8StringEncoding error:NULL]) {
+                [self fixOwnership:p target:t];
+                [KSLog add:@"      ✓ %@", p];
+                wrote = YES;
+            }
+        }
+        if (wrote) {
+            [KSLog add:@"      ✓ 插件会在下次启动快手时替换 did"];
+        } else {
+            [KSLog add:@"      ⚠ ks_did.txt 写入失败，did 可能不生效"];
+        }
+    }
+
+    // ---- 4.6) ★ 清掉插件的「旧 did 学习记录」，让它重新学习 ----
+    {
+        NSString *oldList = [t.dataContainer
+            stringByAppendingPathComponent:@"Documents/.ks_old_dids"];
+        [fm removeItemAtPath:oldList error:NULL];
+        [KSLog add:@"      已清旧 did 记录，插件将重新学习"];
+    }
+
     // ---- 5) 刷新缓存 + 拉起快手 ----
     [KSLog add:@"[5/5] 刷新缓存并拉起快手..."];
     [self flushDaemons];
