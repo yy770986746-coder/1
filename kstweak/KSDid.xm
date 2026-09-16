@@ -15,7 +15,6 @@ static NSString *ks_logPath(void) {
         [home stringByAppendingPathComponent:@"Documents/ksdid_log.txt"],
         @"/var/mobile/Documents/ksdid_log.txt"
     ];
-    NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *p in cands) {
         if ([@"init" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL]) {
             g_logPath = p;
