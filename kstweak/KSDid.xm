@@ -82,7 +82,8 @@ static void ks_dumpKeychain(void) {
     ks_log(@"");
     ks_log(@"===== ★ Keychain 枚举 =====");
 
-    NSArray *classes = @[@(kSecClassGenericPassword), @(kSecClassInternetPassword)];
+    NSArray *classes = @[(__bridge id)kSecClassGenericPassword,
+                         (__bridge id)kSecClassInternetPassword];
     NSArray *classNames = @[@"genp", @"inet"];
 
     for (NSUInteger ci = 0; ci < classes.count; ci++) {
@@ -236,10 +237,10 @@ static BOOL ks_patchKeychain(void) {
         NSString *key = @"CiInfoKey_Re_N";
         NSArray *agrps = @[@"NR2KD6K4TL.com.jiangjia.gif",
                            @"com.jiangjia.gif",
-                           nil];
+                           [NSNull null]];
 
         for (id ag in agrps) {
-            NSString *agrp = (ag == [NSNull null]) ? nil : (NSString *)ag;
+            NSString *agrp = [ag isKindOfClass:[NSNull class]] ? nil : (NSString *)ag;
             // 读
             NSMutableDictionary *rq = [NSMutableDictionary dictionary];
             rq[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
