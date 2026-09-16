@@ -1,5 +1,4 @@
-// 扩展版：记录所有 SecItemCopyMatching 调用（不只 did），找出快手读 did 的真实方式
-
+// 诊断版 v3：输出 Keychain 返回值的实际内容（含 hex），定位 did
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
@@ -7,6 +6,7 @@
 
 static NSString *g_customDid = nil;
 static NSString *g_logPath = nil;
+static int g_callCount = 0;
 
 static NSString *ks_logPath(void) {
     if (g_logPath) return g_logPath;
@@ -48,57 +48,51 @@ static NSString *ks_loadCustomDid(void) {
     NSString *home = NSHomeDirectory();
     if (home.length) {
         [paths addObject:[home stringByAppendingPathComponent:@"Documents/ks_did.txt"]];
-        [paths addObject:[home stringByAppendingPathComponent:
-                          @"Library/Preferences/com.kuaishou.ksdid.plist"]];
     }
     [paths addObject:@"/var/mobile/Documents/ks_did.txt"];
-    [paths addObject:@"/var/mobile/Library/Preferences/com.kuaishou.ksdid.plist"];
     for (NSString *p in paths) {
-        if ([p hasSuffix:@".plist"]) {
-            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
-            id v = d[@"did"];
-            if ([v isKindOfClass:[NSString class]] && ((NSString *)v).length == 36) return v;
-        } else {
-            NSString *t = [NSString stringWithContentsOfFile:p
-                                                    encoding:NSUTF8StringEncoding error:NULL];
-            t = [t stringByTrimmingCharactersInSet:
-                 [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if (t.length == 36) return t;
-        }
+        NSString *t = [NSString stringWithContentsOfFile:p
+                                                encoding:NSUTF8StringEncoding error:NULL];
+        t = [t stringByTrimmingCharactersInSet:
+             [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (t.length == 36) return t;
     }
     return nil;
 }
 
-static BOOL ks_isUUID(NSString *s) {
-    if (s.length != 36) return NO;
-    static NSRegularExpression *re = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        re = [NSRegularExpression regularExpressionWithPattern:
-              @"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
-               "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$" options:0 error:NULL];
-    });
-    return [re numberOfMatchesInString:s options:0 range:NSMakeRange(0, s.length)] > 0;
-}
+/// 把 NSData 转成可读描述：尝试 UTF8，失败则 hex（前 80 字节）
+static NSString *ks_dataDesc(NSData *d) {
+    if (!d.length) return @"(空)";
+    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if (s.length && s.length < 400) {
+        // 纯文本
+        return [NSString stringWithFormat:@"文本(%lu): %@", (unsigned long)d.length, s];
+    }
+    // bplist?
+    NSRange r = [d rangeOfData:[@"bplist" dataUsingEncoding:NSUTF8StringEncoding]
+                       options:0 range:NSMakeRange(0, MIN((NSUInteger)64, d.length))];
+    NSString *tag = (r.location != NSNotFound) ? @"bplist" : @"二进制";
 
-static NSString *ks_replaceUUIDs(NSString *src, NSString *newDid) {
-    if (!src.length || !ks_isUUID(newDid)) return src;
+    NSMutableString *hex = [NSMutableString string];
+    const uint8_t *b = d.bytes;
+    NSUInteger n = MIN((NSUInteger)80, d.length);
+    for (NSUInteger i = 0; i < n; i++) [hex appendFormat:@"%02x", b[i]];
+
+    // 找明文 UUID（如果有）
+    NSString *raw = [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
+    NSString *found = @"";
     NSRegularExpression *re =
         [NSRegularExpression regularExpressionWithPattern:
          @"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
           "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}" options:0 error:NULL];
-    NSArray *ms = [re matchesInString:src options:0 range:NSMakeRange(0, src.length)];
-    if (!ms.count) return src;
-    NSMutableString *out = [NSMutableString stringWithString:src];
-    for (NSInteger i = (NSInteger)ms.count - 1; i >= 0; i--) {
-        NSTextCheckingResult *r = (NSTextCheckingResult *)ms[(NSUInteger)i];
-        [out replaceCharactersInRange:r.range withString:newDid];
+    if (raw.length) {
+        NSTextCheckingResult *m = [re firstMatchInString:raw options:0
+                                                   range:NSMakeRange(0, raw.length)];
+        if (m) found = [NSString stringWithFormat:@" UUID=%@", [raw substringWithRange:m.range]];
     }
-    return out;
+    return [NSString stringWithFormat:@"%@(%lu)%@ hex=%s",
+            tag, (unsigned long)d.length, found, hex.UTF8String];
 }
-
-// 计数器，避免日志刷爆
-static int g_callCount = 0;
 
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
 
@@ -112,90 +106,34 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
         NSDictionary *q = (__bridge NSDictionary *)query;
         id svc  = q[(__bridge id)kSecAttrService];
         id acct = q[(__bridge id)kSecAttrAccount];
+        NSString *svcS = [svc isKindOfClass:[NSString class]] ? svc : @"";
 
-        // 只记录前 100 次 + 含 CiInfo/did 关键字的
-        BOOL isDidK = NO;
-        for (id o in @[svc ?: [NSNull null], acct ?: [NSNull null]]) {
-            if ([o isKindOfClass:[NSString class]]) {
-                NSString *s = (NSString *)o;
-                if ([s rangeOfString:@"CiInfo"].location != NSNotFound ||
-                    [s rangeOfString:@"did"].location != NSNotFound ||
-                    [s rangeOfString:@"Did"].location != NSNotFound ||
-                    [s rangeOfString:@"DID"].location != NSNotFound ||
-                    [s rangeOfString:@"cloud"].location != NSNotFound ||
-                    [s rangeOfString:@"EAccount"].location != NSNotFound) {
-                    isDidK = YES;
-                }
+        // 只关心这些候选键
+        BOOL interesting = NO;
+        for (NSString *k in @[@"KSCommonIDFA", @"openSDK.deviceId", @"weapon",
+                              @"CiInfo", @"did", @"Did", @"DID", @"device",
+                              @"EAccount", @"IDFA", @"idfa", @"DFP"]) {
+            if (svcS.length && [svcS rangeOfString:k].location != NSNotFound) {
+                interesting = YES; break;
             }
         }
 
-        if (isDidK || g_callCount <= 60) {
-            ks_log(@"[C%d] ret=%d svc=%@ acct=%@",
-                   g_callCount, (int)ret,
-                   [svc isKindOfClass:[NSString class]] ? svc : @"(非字符串)",
-                   [acct isKindOfClass:[NSString class]] ? acct : @"(非字符串)");
-
+        if (interesting) {
+            ks_log(@"[C%d] svc=%@ ret=%d", g_callCount, svcS, (int)ret);
             if (result && *result) {
                 id v = (__bridge id)*result;
                 if ([v isKindOfClass:[NSData class]]) {
-                    NSData *d = (NSData *)v;
-                    NSString *s2 = [[NSString alloc] initWithData:d
-                                                         encoding:NSUTF8StringEncoding];
-                    if (s2.length && s2.length < 300) ks_log(@"     值: %@", s2);
-                    else ks_log(@"     NSData %lu 字节", (unsigned long)d.length);
-                } else {
-                    ks_log(@"     类型: %@", NSStringFromClass([v class]));
-                }
-            }
-        }
-
-        // 命中 did 就替换
-        if (isDidK && g_customDid.length && ret == errSecSuccess && result && *result) {
-            id val = (__bridge id)*result;
-            NSData *data = nil;
-            BOOL isDictResult = NO;
-            if ([val isKindOfClass:[NSData class]]) data = (NSData *)val;
-            else if ([val isKindOfClass:[NSDictionary class]]) {
-                isDictResult = YES;
-                id d2 = ((NSDictionary *)val)[(__bridge id)kSecValueData];
-                if ([d2 isKindOfClass:[NSData class]]) data = d2;
-            }
-            if (data.length && data.length < 256 * 1024) {
-                NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                if (s.length) {
-                    NSString *target = s;
-                    BOOL wasB64 = NO;
-                    NSData *dec = [[NSData alloc] initWithBase64EncodedString:s options:0];
-                    if (dec.length) {
-                        NSString *t2 = [[NSString alloc] initWithData:dec
-                                                             encoding:NSUTF8StringEncoding];
-                        if (t2.length && [t2 rangeOfString:@"-"].location != NSNotFound) {
-                            target = t2; wasB64 = YES;
-                        }
-                    }
-                    NSString *rep = ks_replaceUUIDs(target, g_customDid);
-                    if (![rep isEqualToString:target]) {
-                        NSData *nd = wasB64
-                            ? [[rep dataUsingEncoding:NSUTF8StringEncoding] base64EncodedDataWithOptions:0]
-                            : [rep dataUsingEncoding:NSUTF8StringEncoding];
-                        if (nd.length) {
-                            ks_log(@"[SET] %@ → %@", target, rep);
-                            if (!isDictResult) {
-                                CFTypeRef old = *result;
-                                *result = (__bridge_retained CFTypeRef)nd;
-                                if (old) CFRelease(old);
-                            } else {
-                                NSMutableDictionary *md =
-                                    [NSMutableDictionary dictionaryWithDictionary:val];
-                                md[(__bridge id)kSecValueData] = nd;
-                                CFTypeRef old = *result;
-                                *result = (__bridge_retained CFTypeRef)md;
-                                if (old) CFRelease(old);
-                            }
-                        }
+                    ks_log(@"     data: %@", ks_dataDesc((NSData *)v));
+                } else if ([v isKindOfClass:[NSDictionary class]]) {
+                    NSDictionary *dd = (NSDictionary *)v;
+                    id data2 = dd[(__bridge id)kSecValueData];
+                    if ([data2 isKindOfClass:[NSData class]]) {
+                        ks_log(@"     dict.data: %@", ks_dataDesc((NSData *)data2));
                     } else {
-                        ks_log(@"[SKIP] 无 UUID 可替换");
+                        ks_log(@"     dict keys: %@", [[dd allKeys] componentsJoinedByString:@","]);
                     }
+                } else {
+                    ks_log(@"     %@: %@", NSStringFromClass([v class]), v);
                 }
             }
         }
@@ -211,7 +149,7 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
          [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ksdid_log.txt"]
                                                  error:NULL];
         g_customDid = ks_loadCustomDid();
-        ks_log(@"===== KSDid 诊断版 v2 =====");
+        ks_log(@"===== KSDid 诊断版 v3 =====");
         ks_log(@"沙盒: %@", NSHomeDirectory());
         ks_log(@"自定义 did = %@", g_customDid ?: @"(未配置)");
 
