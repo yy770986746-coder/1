@@ -34,9 +34,9 @@ jobs:
         working-directory: kstweak
         run: |
           set -e
-          export ARCHS="arm64 arm64e"
+          export ARCHS="arm64"
           make clean 2>/dev/null || true
-          make package FINALPACKAGE=1 ARCHS="arm64 arm64e" THEOS_PACKAGE_ARCH=iphoneos-arm64e 2>&1 | tail -40
+          make package FINALPACKAGE=1 ARCHS="arm64" THEOS_PACKAGE_ARCH=iphoneos-arm64 2>&1 | tail -40
           echo "=== 产物 ==="
           ls -la packages/ || true
 
@@ -53,8 +53,8 @@ jobs:
           #   这里解包→改 control→重打包，强制成 iphoneos-arm64e
           WORK=$(mktemp -d)
           dpkg-deb -R "$DEB" "$WORK"
-          sed -i '' 's/^Architecture:.*/Architecture: iphoneos-arm64e/' "$WORK/DEBIAN/control" || \
-            sed -i 's/^Architecture:.*/Architecture: iphoneos-arm64e/' "$WORK/DEBIAN/control"
+          sed -i '' 's/^Architecture:.*/Architecture: iphoneos-arm64/' "$WORK/DEBIAN/control" || \
+            sed -i 's/^Architecture:.*/Architecture: iphoneos-arm64/' "$WORK/DEBIAN/control"
           cat "$WORK/DEBIAN/control"
           dpkg-deb -b "$WORK" "$DEB"
           rm -rf "$WORK"
