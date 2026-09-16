@@ -1,15 +1,11 @@
 TARGET := iphone:clang:latest:14.0
 INSTALL_TARGET_PROCESSES := com.jiangjia.gif
-ARCHS := arm64e
+ARCHS := arm64 arm64e
 
-# ★ 不用 THEOS_PACKAGE_SCHEME := rootless
-#   实测对比（能工作的 ksextract）：
-#     deb 里路径是 /Library/MobileSubstrate/DynamicLibraries/xxx.dylib  （无 /var/jb 前缀）
-#     control 里声明 Pre-Depends: rootless-compat (>= 0.9)
-#     → 安装时 rootless-compat 会把路径转换成 /var/jb/... 并触发 RootHide 镜像到 pkgmirror
-#   而我们用 rootless scheme 打出来的 deb 直接写 /var/jb/...，
-#   RootHide 不会镜像，导致 ElleKit 不加载插件。
-THEOS_PACKAGE_SCHEME :=
+# ★ 用 Theos 标准 rootless scheme（Dopamine 兼容）
+#   Dopamine 是标准无根越狱，ElleKit 从 /var/jb/Library/MobileSubstrate/DynamicLibraries
+#   加载插件，这是 Theos 的默认布局。
+THEOS_PACKAGE_SCHEME := rootless
 
 include $(THEOS)/makefiles/common.mk
 
