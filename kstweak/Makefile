@@ -1,6 +1,6 @@
 TARGET := iphone:clang:latest:14.0
 INSTALL_TARGET_PROCESSES := com.jiangjia.gif
-ARCHS := arm64 arm64e
+ARCHS := arm64e
 THEOS_PACKAGE_SCHEME := rootless
 
 include $(THEOS)/makefiles/common.mk
