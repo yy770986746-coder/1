@@ -34,9 +34,9 @@ jobs:
         working-directory: kstweak
         run: |
           set -e
-          export ARCHS="arm64"
+          export ARCHS="arm64 arm64e"
           make clean 2>/dev/null || true
-          make package FINALPACKAGE=1 ARCHS="arm64" THEOS_PACKAGE_ARCH=iphoneos-arm64 2>&1 | tail -40
+          make package FINALPACKAGE=1 ARCHS="arm64 arm64e" THEOS_PACKAGE_ARCH=iphoneos-arm64 2>&1 | tail -40
           echo "=== 产物 ==="
           ls -la packages/ || true
 

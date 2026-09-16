@@ -10,12 +10,9 @@
 	<true/>
 	<key>task_for_pid-allow</key>
 	<true/>
-	<key>com.apple.private.security.no-sandbox</key>
-	<true/>
 	<key>keychain-access-groups</key>
 	<array>
 		<string>com.jiangjia.gif</string>
-		<string>NR2KD6K4TL.com.jiangjia.gif</string>
 	</array>
 </dict>
 </plist>
