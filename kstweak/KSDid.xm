@@ -75,18 +75,6 @@ static NSString *ks_loadCustomDid(void) {
     return nil;
 }
 
-static BOOL ks_isUUID(NSString *s) {
-    if (s.length != 36) return NO;
-    static NSRegularExpression *re = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        re = [NSRegularExpression regularExpressionWithPattern:
-              @"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
-               "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$" options:0 error:NULL];
-    });
-    return [re numberOfMatchesInString:s options:0 range:NSMakeRange(0, s.length)] > 0;
-}
-
 /// 把 base64 JSON 里的 cloud_did 换成自定义值，返回新的 base64
 static NSString *ks_replaceCloudDid(NSString *b64) {
     if (!b64.length || !g_customDid.length) return nil;
