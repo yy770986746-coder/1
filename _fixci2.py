@@ -1,36 +1,18 @@
-name: Build KSDid Tweak
+# -*- coding: utf-8 -*-
+"""改 CI：make 后直接改写 deb 里的 control（最可靠）"""
+import sys, io, os, re
 
-on:
-  push:
-    paths:
-      - 'kstweak/**'
-  workflow_dispatch:
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+p = r"C:\Users\yyds\Desktop\ios快手上号器\.github\workflows\tweak.yml"
+s = open(p, encoding="utf-8").read()
 
-jobs:
-  build:
-    runs-on: macos-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+# 替换整个 build + verify 段
+start = s.find("      - name: Build tweak")
+end = s.find("      - name: Upload .deb")
+if start < 0 or end < 0:
+    print("✗ 找不到目标段"); sys.exit(1)
 
-      - name: Install Theos dependencies
-        run: brew install ldid dpkg xz
-
-      - name: Install Theos
-        run: |
-          export THEOS="$HOME/theos"
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
-          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
-
-      - name: Link iOS SDK
-        run: |
-          mkdir -p "$THEOS/sdks"
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          ln -sf "$SDK" "$THEOS/sdks/iPhoneOS.sdk"
-          echo "SDK=$SDK"
-          ls -la "$THEOS/sdks/"
-
-      - name: Build tweak
+new_block = '''      - name: Build tweak
         working-directory: kstweak
         run: |
           set -e
@@ -53,7 +35,7 @@ jobs:
           #   这里解包→改 control→重打包，强制成 iphoneos-arm64e
           WORK=$(mktemp -d)
           dpkg-deb -R "$DEB" "$WORK"
-          sed -i '' 's/^Architecture:.*/Architecture: iphoneos-arm64e/' "$WORK/DEBIAN/control" || \
+          sed -i '' 's/^Architecture:.*/Architecture: iphoneos-arm64e/' "$WORK/DEBIAN/control" || \\
             sed -i 's/^Architecture:.*/Architecture: iphoneos-arm64e/' "$WORK/DEBIAN/control"
           cat "$WORK/DEBIAN/control"
           dpkg-deb -b "$WORK" "$DEB"
@@ -74,11 +56,13 @@ jobs:
             echo "架构不对，应为 iphoneos-arm64e"; exit 1
           fi
           dpkg-deb -x "$DEB" /tmp/x
-          find /tmp/x -name '*.dylib' -exec file {} \;
+          find /tmp/x -name '*.dylib' -exec file {} \\;
 
-      - name: Upload .deb
-        uses: actions/upload-artifact@v4
-        with:
-          name: ks-did-tweak
-          path: kstweak/packages/*.deb
-          if-no-files-found: error
+'''
+
+s = s[:start] + new_block + s[end:]
+open(p, "w", encoding="utf-8", newline="\n").write(s)
+print("✓ CI 已重写")
+print()
+print("=== 新 CI 内容 ===")
+print(s[s.find("- name: Build tweak"):s.find("- name: Upload")][:2000])
