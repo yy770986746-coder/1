@@ -34,10 +34,18 @@ jobs:
         working-directory: kstweak
         run: |
           set -e
+          # ★ 强制 control 的架构为 arm64e（Theos 会用 ARCHS 覆盖，需在 make 前改）
+          sed -i '' 's/^Architecture:.*/Architecture: iphoneos-arm64e/' control || \
+            sed -i 's/^Architecture:.*/Architecture: iphoneos-arm64e/' control
+          echo "=== control 内容 ==="
+          cat control
           make clean 2>/dev/null || true
-          make package FINALPACKAGE=1 2>&1 | tail -40
+          make package FINALPACKAGE=1 ARCHS="arm64e" 2>&1 | tail -40
           echo "=== 产物 ==="
           ls -la packages/ || true
+          echo "=== 产物架构 ==="
+          DEB=$(ls packages/*.deb 2>/dev/null | head -1)
+          dpkg-deb -f "$DEB" Architecture || true
 
       - name: Verify deb
         working-directory: kstweak
