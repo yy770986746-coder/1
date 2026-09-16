@@ -69,7 +69,7 @@ static NSString *ks_hex(NSData *d, NSUInteger maxLen) {
     if (!d.length) return @"(空)";
     NSUInteger n = MIN(d.length, maxLen);
     NSMutableString *s = [NSMutableString string];
-    const uint8_t *b = d.bytes;
+    const uint8_t *b = (const uint8_t *)[d bytes];
     for (NSUInteger i = 0; i < n; i++) [s appendFormat:@"%02x", b[i]];
     if (d.length > maxLen) [s appendFormat:@"...(%lu字节)", (unsigned long)d.length];
     return s;
