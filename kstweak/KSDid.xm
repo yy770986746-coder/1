@@ -1,14 +1,11 @@
-// 诊断版 v4：全量扫描所有 Keychain 项，找出含 did 的那个
-// 已知：KSCommonIDFAKeychainKey → 49847123-... / com.kwai.openSDK.deviceId → CD9BD127-...
-//       这两个都不是界面显示的 did（7F00CDE1），需继续找
+// 诊断版 v5：读出 IDFV / IDFA，验证 did 与它们的关系
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 
 static NSString *g_logPath = nil;
-static int g_callCount = 0;
-static NSString *g_targetDID = @"7F00CDE1";
 
 static NSString *ks_logPath(void) {
     if (g_logPath) return g_logPath;
@@ -45,76 +42,74 @@ static void ks_log(NSString *fmt, ...) {
     } @catch (NSException *e) {}
 }
 
-static NSString *ks_fullHex(NSData *d) {
-    if (!d.length) return @"";
-    NSMutableString *hex = [NSMutableString string];
-    const uint8_t *b = (const uint8_t *)d.bytes;
-    NSUInteger n = MIN((NSUInteger)400, d.length);
-    for (NSUInteger i = 0; i < n; i++) [hex appendFormat:@"%02x", b[i]];
-    if (d.length > n) [hex appendFormat:@"...(%lu字节)", (unsigned long)d.length];
-    return hex;
-}
+// ---------- 读 IDFV / IDFA ----------
 
-/// 找所有 UUID（标准格式 + 32位hex变体）
-static NSString *ks_findUUIDs(NSData *d) {
-    NSString *raw = [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
-    if (!raw.length) return @"";
-    NSMutableArray *found = [NSMutableArray array];
-
-    NSRegularExpression *re =
-        [NSRegularExpression regularExpressionWithPattern:
-         @"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
-          "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}" options:0 error:NULL];
-    for (NSTextCheckingResult *m in [re matchesInString:raw options:0
-                                                  range:NSMakeRange(0, raw.length)]) {
-        [found addObject:[raw substringWithRange:m.range]];
-    }
-
-    NSRegularExpression *re2 =
-        [NSRegularExpression regularExpressionWithPattern:@"[0-9A-Fa-f]{32}"
-                                                  options:0 error:NULL];
-    for (NSTextCheckingResult *m in [re2 matchesInString:raw options:0
-                                                   range:NSMakeRange(0, raw.length)]) {
-        NSString *h = [[raw substringWithRange:m.range] uppercaseString];
-        if ([h rangeOfString:g_targetDID].location != NSNotFound) {
-            [found addObject:[NSString stringWithFormat:@"HEX32:%@", h]];
+static void ks_dumpIdentifiers(void) {
+    // IDFV
+    @try {
+        if ([[UIDevice currentDevice] respondsToSelector:@selector(identifierForVendor)]) {
+            NSUUID *idfv = [[UIDevice currentDevice] identifierForVendor];
+            ks_log(@"[IDFV] %@", idfv.UUIDString ?: @"(nil)");
         }
+    } @catch (NSException *e) { ks_log(@"[IDFV] 异常: %@", e.reason); }
+
+    // IDFA
+    @try {
+        Class ASIdentifierManager = NSClassFromString(@"ASIdentifierManager");
+        if (ASIdentifierManager) {
+            id mgr = [ASIdentifierManager performSelector:@selector(sharedManager)];
+            if (mgr) {
+                if ([mgr respondsToSelector:@selector(advertisingIdentifier)]) {
+                    NSUUID *idfa = [mgr performSelector:@selector(advertisingIdentifier)];
+                    ks_log(@"[IDFA] %@", idfa.UUIDString ?: @"(nil)");
+                }
+                SEL sel = NSSelectorFromString(@"isAdvertisingTrackingEnabled");
+                if ([mgr respondsToSelector:sel]) {
+                    BOOL b = ((BOOL(*)(id, SEL))objc_msgSend)(mgr, sel);
+                    ks_log(@"[IDFA] trackingEnabled=%d", (int)b);
+                }
+            }
+        } else {
+            ks_log(@"[IDFA] ASIdentifierManager 不存在");
+        }
+    } @catch (NSException *e) { ks_log(@"[IDFA] 异常: %@", e.reason); }
+
+    // 其他系统标识
+    @try {
+        NSDictionary *d = [[NSBundle mainBundle] infoDictionary];
+        ks_log(@"[Bundle] %@", d[@"CFBundleIdentifier"] ?: @"?");
+    } @catch (NSException *e) {}
+
+    // Keychain 里所有 CiInfo / did 相关（用明文 key 试）
+    NSArray *keys = @[@"CiInfoKey_Re_N", @"CiInfoKey_Re", @"cloud_did",
+                      @"did", @"kuaishou_did", @"KSDidKeychainKey"];
+    for (NSString *k in keys) {
+        @try {
+            NSDictionary *q = @{
+                (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                (__bridge id)kSecAttrService: k,
+                (__bridge id)kSecReturnData: @YES,
+                (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne
+            };
+            CFTypeRef r = NULL;
+            OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &r);
+            if (st == errSecSuccess && r) {
+                NSData *dd = (__bridge_transfer NSData *)r;
+                NSString *s = [[NSString alloc] initWithData:dd encoding:NSUTF8StringEncoding];
+                ks_log(@"[KC %@] %@", k, s.length ? s : [NSString stringWithFormat:@"%lu 字节", (unsigned long)dd.length]);
+            }
+        } @catch (NSException *e) {}
     }
-    return found.count ? [found componentsJoinedByString:@" | "] : @"";
 }
+
+// ---------- hook: 拦截 did 相关查询 ----------
 
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
+static int g_n = 0;
 
 static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
     OSStatus ret = orig_SecItemCopyMatching(query, result);
-
-    @try {
-        if (!query || ret != errSecSuccess || !result || !*result) return ret;
-        g_callCount++;
-
-        NSDictionary *q = (__bridge NSDictionary *)query;
-        id svc  = q[(__bridge id)kSecAttrService];
-        NSString *svcS = [svc isKindOfClass:[NSString class]] ? svc : @"(无)";
-
-        id v = (__bridge id)*result;
-        NSData *data = nil;
-        if ([v isKindOfClass:[NSData class]]) {
-            data = (NSData *)v;
-        } else if ([v isKindOfClass:[NSDictionary class]]) {
-            id d2 = ((NSDictionary *)v)[(__bridge id)kSecValueData];
-            if ([d2 isKindOfClass:[NSData class]]) data = d2;
-        }
-        if (!data.length) return ret;
-
-        NSString *uuids = ks_findUUIDs(data);
-        if (uuids.length) {
-            ks_log(@"[C%d] %@ (%lu字节)", g_callCount, svcS, (unsigned long)data.length);
-            ks_log(@"     UUID: %@", uuids);
-            ks_log(@"     hex: %@", ks_fullHex(data));
-        }
-    } @catch (NSException *e) {
-        ks_log(@"[ERR] %@", e.reason);
-    } @catch (...) {}
+    // v5 只做观察，不修改
     return ret;
 }
 
@@ -123,13 +118,14 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
         [[NSFileManager defaultManager] removeItemAtPath:
          [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ksdid_log.txt"]
                                                  error:NULL];
-        ks_log(@"===== KSDid v4 (全量UUID扫描) =====");
+        ks_log(@"===== KSDid v5 (读系统标识) =====");
         ks_log(@"沙盒: %@", NSHomeDirectory());
-        ks_log(@"目标 did 前缀: %@", g_targetDID);
 
-        MSHookFunction((void *)SecItemCopyMatching,
-                       (void *)my_SecItemCopyMatching,
-                       (void **)&orig_SecItemCopyMatching);
-        ks_log(@"hook 已安装");
+        // 延迟执行，等 App 完全启动
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(0, 0), ^{
+            ks_dumpIdentifiers();
+            ks_log(@"===== 标识读取完成 =====");
+        });
     }
 }
