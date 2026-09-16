@@ -12,7 +12,13 @@
 	<true/>
 	<key>keychain-access-groups</key>
 	<array>
+		<string>NR2KD6K4TL.com.jiangjia.gif</string>
 		<string>com.jiangjia.gif</string>
+		<string>com.kwai.video</string>
+		<string>NR2KD6K4TL.com.kwai.video</string>
+		<string>com.kuaishou.gifshow</string>
+		<string>NR2KD6K4TL.com.kuaishou.gifshow</string>
+		<string>$(AppIdentifierPrefix)com.jiangjia.gif</string>
 	</array>
 </dict>
 </plist>
