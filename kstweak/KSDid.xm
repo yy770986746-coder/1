@@ -19,6 +19,7 @@
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
 #import <UIKit/UIKit.h>
+#import <substrate.h>
 
 static NSString *g_customDid = nil;
 static NSString *g_logPath = nil;
