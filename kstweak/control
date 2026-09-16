@@ -7,3 +7,4 @@ Maintainer: momo
 Author: momo
 Section: Tweaks
 Depends: mobilesubstrate | ellekit, firmware (>= 14.0)
+Pre-Depends: rootless-compat (>= 0.9)
